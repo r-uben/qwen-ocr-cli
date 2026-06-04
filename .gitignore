@@ -1,0 +1,14 @@
+# venv lives OUTSIDE iCloud (UV_PROJECT_ENVIRONMENT); never track it
+.venv
+.venv*
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+dist/
+build/
+*.egg-info/
+.DS_Store
