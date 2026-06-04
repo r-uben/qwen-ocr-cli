@@ -26,10 +26,10 @@ _FACTORIES = {
 }
 
 
-def make_backend(name: str) -> Backend:
-    """Construct a single named backend."""
+def make_backend(name: str, model: str | None = None) -> Backend:
+    """Construct a single named backend, optionally overriding its model."""
     try:
-        return _FACTORIES[name]()
+        return _FACTORIES[name](model=model)
     except KeyError:
         raise ValueError(
             f"unknown backend {name!r}; choose from {sorted(_FACTORIES)} or 'auto'"
@@ -41,7 +41,7 @@ def probe_all() -> dict[str, Availability]:
     return {name: factory().availability() for name, factory in _FACTORIES.items()}
 
 
-def resolve_backend(prefer: str = "cost") -> Backend:
+def resolve_backend(prefer: str = "cost", model: str | None = None) -> Backend:
     """Return the first available backend in the preference order."""
     order = _ORDER.get(prefer)
     if order is None:
@@ -49,7 +49,7 @@ def resolve_backend(prefer: str = "cost") -> Backend:
 
     reasons: list[str] = []
     for name in order:
-        backend = _FACTORIES[name]()
+        backend = _FACTORIES[name](model=model)
         avail = backend.availability()
         if avail.ok:
             return backend

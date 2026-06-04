@@ -52,7 +52,7 @@ def test_process_writes_output(monkeypatch, tmp_path):
     Image.new("RGB", (40, 40), "white").save(src / "page.png")
     out = tmp_path / "out"
 
-    monkeypatch.setattr(cli, "make_backend", lambda name: FakeBackend())
+    monkeypatch.setattr(cli, "make_backend", lambda name, model=None: FakeBackend())
 
     res = CliRunner().invoke(
         cli.main, ["process", str(src), "-o", str(out), "--backend", "ollama"]
@@ -70,7 +70,7 @@ def test_explicit_backend_unavailable_errors(monkeypatch, tmp_path):
         def availability(self):
             return Availability(False, "server down")
 
-    monkeypatch.setattr(cli, "make_backend", lambda name: Dead())
+    monkeypatch.setattr(cli, "make_backend", lambda name, model=None: Dead())
     res = CliRunner().invoke(
         cli.main, ["process", str(src), "-o", str(tmp_path / "o"), "--backend", "vllm"]
     )
