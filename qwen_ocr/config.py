@@ -28,7 +28,11 @@ DEFAULT_DPI = 300          # higher than socr's 200 — validated lever for loca
 MAX_IMAGE_SIDE = 4000      # downscale longest side before sending (token/cost guard)
 MAX_OUTPUT_TOKENS = 8192
 TEMPERATURE = 0.0
-REPETITION_PENALTY = 1.05  # curbs degenerate loops on dense/high-res pages
+# Neutral (1.0) by design: a repetition penalty CORRUPTS OCR of tables/forms, whose
+# cells, separators, zeros and aligned spacing are legitimately repetitive. Degenerate
+# loops are handled downstream by utils.trim_degenerate_tail instead (Gemini research,
+# corroborating Dasanaike's post-processing approach). Raise only with evidence.
+REPETITION_PENALTY = 1.0
 REQUEST_TIMEOUT = 300.0
 
 OCR_PROMPT = (
