@@ -62,6 +62,21 @@ def test_ollama_matches_model_with_tag(monkeypatch):
     assert OllamaBackend(model="qwen3-vl").is_available()
 
 
+def test_ollama_endpoint_sends_resolved_tag(monkeypatch):
+    # Regression: bare "qwen3-vl" must be sent as the concrete installed tag
+    # ("qwen3-vl:8b"), else Ollama 404s on an unresolvable model.
+    def fake_get(url, timeout):
+        return httpx.Response(
+            200, json={"models": [{"name": "qwen3-vl:8b"}]},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    b = OllamaBackend(model="qwen3-vl")
+    _, _, model = b._endpoint()  # lazily probes + resolves
+    assert model == "qwen3-vl:8b"
+
+
 # --- image encoding + response parsing ---
 
 def test_encode_image_downscales(tmp_path):

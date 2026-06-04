@@ -14,10 +14,16 @@ class OllamaBackend(Backend):
     def __init__(self, base_url: str | None = None, model: str | None = None) -> None:
         self.base_url = base_url or config.OLLAMA_URL
         self.model = model or config.OLLAMA_MODEL
+        self._resolved_model: str | None = None  # concrete installed tag, set by probe
 
     def _endpoint(self) -> tuple[str, str | None, str]:
+        # Send the concrete installed tag (e.g. "qwen3-vl:8b"), not the bare name:
+        # Ollama 404s on an unresolvable model. Resolve lazily if not probed yet.
+        if self._resolved_model is None:
+            self.availability()
+        model = self._resolved_model or self.model
         # Ollama's OpenAI-compatible endpoint ignores the key but one is required.
-        return self.base_url, "ollama", self.model
+        return self.base_url, "ollama", model
 
     def availability(self) -> Availability:
         # Ollama exposes /api/tags at the host root (not under /v1).
@@ -30,9 +36,14 @@ class OllamaBackend(Backend):
         except Exception as exc:  # daemon down / unreachable
             return Availability(False, f"Ollama not reachable at {root} ({exc})")
 
-        names = {m.get("name", "") for m in resp.json().get("models", [])}
-        # Match with or without an explicit :tag (e.g. "qwen3-vl" vs "qwen3-vl:latest").
-        if any(n == self.model or n.split(":")[0] == self.model for n in names):
+        names = [m.get("name", "") for m in resp.json().get("models", [])]
+        # Prefer an exact match; else the first tagged variant (qwen3-vl → qwen3-vl:8b).
+        match = next(
+            (n for n in names if n == self.model),
+            next((n for n in names if n.split(":")[0] == self.model), None),
+        )
+        if match:
+            self._resolved_model = match
             return Availability(True)
         return Availability(
             False, f"model '{self.model}' not pulled (run: ollama pull {self.model})"
