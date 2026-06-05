@@ -46,6 +46,4 @@ class ApiBackend(Backend):
     def availability(self) -> Availability:
         if self.provider:
             return Availability(True)
-        return Availability(
-            False, "no API key (set DASHSCOPE_API_KEY or OPENROUTER_API_KEY)"
-        )
+        return Availability(False, "no API key (set DASHSCOPE_API_KEY or OPENROUTER_API_KEY)")

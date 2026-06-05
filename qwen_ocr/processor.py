@@ -145,9 +145,7 @@ def _ocr_one_document(
         raise ValueError(f"unsupported input: {doc} (expected a .pdf or a directory)")
     except Exception as exc:
         logger.error("could not process %s: %s", doc, exc)
-        return DocResult(
-            source=doc, pages=[], processing_time=time.time() - start, error=str(exc)
-        )
+        return DocResult(source=doc, pages=[], processing_time=time.time() - start, error=str(exc))
 
 
 def _gather_images(directory: Path) -> list[Path]:

@@ -48,7 +48,8 @@ def test_process_subcommand_listed():
 
 def test_backends_listing(monkeypatch):
     monkeypatch.setattr(
-        cli, "probe_all",
+        cli,
+        "probe_all",
         lambda: {"ollama": Availability(True), "api": Availability(False, "no key")},
     )
     res = CliRunner().invoke(cli.main, ["backends"])
@@ -64,9 +65,7 @@ def test_process_writes_canonical_output(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "make_backend", lambda name, model=None: FakeBackend())
 
-    res = CliRunner().invoke(
-        cli.main, ["process", str(pdf), "-o", str(out), "--backend", "ollama"]
-    )
+    res = CliRunner().invoke(cli.main, ["process", str(pdf), "-o", str(out), "--backend", "ollama"])
     assert res.exit_code == 0, res.output
     body = (out / "doc" / "doc.md").read_text()
     assert "## Page 1" in body and "## Page 2" in body
@@ -106,9 +105,7 @@ def test_empty_response_exits_nonzero(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "make_backend", lambda name, model=None: FakeBackend(text=""))
 
-    res = CliRunner().invoke(
-        cli.main, ["process", str(pdf), "-o", str(out), "--backend", "ollama"]
-    )
+    res = CliRunner().invoke(cli.main, ["process", str(pdf), "-o", str(out), "--backend", "ollama"])
     assert res.exit_code != 0
 
 

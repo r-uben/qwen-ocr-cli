@@ -34,17 +34,37 @@ def main() -> None:
 @main.command()
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option(
-    "-o", "--output", "output", type=click.Path(path_type=Path), default=None,
+    "-o",
+    "--output",
+    "output",
+    type=click.Path(path_type=Path),
+    default=None,
     help="Output root (default: <input-parent>/ocr/). Writes <stem>/<stem>.md per document.",
 )
-@click.option("--backend", type=click.Choice(["auto", "ollama", "vllm", "api"]),
-              default="auto", show_default=True, help="OCR backend, or auto-select.")
-@click.option("--prefer", type=click.Choice(["cost", "quality", "speed"]),
-              default="cost", show_default=True, help="Auto-select bias (backend=auto only).")
-@click.option("--model", default=None,
-              help="Override the backend model (e.g. qwen3.5:27b, qwen3.5:cloud).")
-@click.option("--dpi", type=int, default=config.DEFAULT_DPI, show_default=True,
-              help="Render DPI for PDF pages.")
+@click.option(
+    "--backend",
+    type=click.Choice(["auto", "ollama", "vllm", "api"]),
+    default="auto",
+    show_default=True,
+    help="OCR backend, or auto-select.",
+)
+@click.option(
+    "--prefer",
+    type=click.Choice(["cost", "quality", "speed"]),
+    default="cost",
+    show_default=True,
+    help="Auto-select bias (backend=auto only).",
+)
+@click.option(
+    "--model", default=None, help="Override the backend model (e.g. qwen3.5:27b, qwen3.5:cloud)."
+)
+@click.option(
+    "--dpi",
+    type=int,
+    default=config.DEFAULT_DPI,
+    show_default=True,
+    help="Render DPI for PDF pages.",
+)
 @click.option("-w", "--workers", type=int, default=1, help="Reserved for parallel pages.")
 @click.option("--reprocess", is_flag=True, help="Re-OCR documents already recorded completed.")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress; emit output paths only.")
@@ -58,7 +78,8 @@ def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess,
 
     try:
         engine = (
-            resolve_backend(prefer, model=model) if backend == "auto"
+            resolve_backend(prefer, model=model)
+            if backend == "auto"
             else make_backend(backend, model=model)
         )
     except (RuntimeError, ValueError) as exc:
@@ -72,7 +93,10 @@ def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess,
     params = InferenceParams()
     try:
         outcome = process(
-            Path(source), engine, params, dpi,
+            Path(source),
+            engine,
+            params,
+            dpi,
             output_dir=Path(output) if output else None,
             reprocess=reprocess,
         )
