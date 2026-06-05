@@ -1,9 +1,14 @@
 """qwen-ocr CLI — Click group matching the socr engine contract.
 
-    qwen-ocr process <path-or-dir> -o <out> [--backend auto|ollama|vllm|api]
-                     [--prefer cost|quality|speed] [--dpi N] [-w N] [-q] [--verbose] [--reprocess]
+    qwen-ocr process <path-or-dir> [-o <out>] [--backend auto|ollama|vllm|api]
+                     [--prefer cost|quality|speed] [--model M] [--dpi N]
+                     [-w N] [-q] [--verbose] [--reprocess]
     qwen-ocr backends
     qwen-ocr --version
+
+Output goes to ``<input-parent>/ocr/`` by default (``-o`` overrides; never
+required), and is written through the shared ``ocr-output-contract`` package so
+qwen's output is byte-structure-identical to the rest of the engine family.
 """
 
 from __future__ import annotations
@@ -28,8 +33,10 @@ def main() -> None:
 
 @main.command()
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
-@click.option("-o", "--output", "output", type=click.Path(path_type=Path), required=True,
-              help="Output directory; writes {out}/{stem}/{stem}.md per page.")
+@click.option(
+    "-o", "--output", "output", type=click.Path(path_type=Path), default=None,
+    help="Output root (default: <input-parent>/ocr/). Writes <stem>/<stem>.md per document.",
+)
 @click.option("--backend", type=click.Choice(["auto", "ollama", "vllm", "api"]),
               default="auto", show_default=True, help="OCR backend, or auto-select.")
 @click.option("--prefer", type=click.Choice(["cost", "quality", "speed"]),
@@ -39,11 +46,11 @@ def main() -> None:
 @click.option("--dpi", type=int, default=config.DEFAULT_DPI, show_default=True,
               help="Render DPI for PDF pages.")
 @click.option("-w", "--workers", type=int, default=1, help="Reserved for parallel pages.")
-@click.option("--reprocess", is_flag=True, help="Re-OCR pages whose .md already exists.")
-@click.option("-q", "--quiet", is_flag=True, help="Suppress progress output.")
+@click.option("--reprocess", is_flag=True, help="Re-OCR documents already recorded completed.")
+@click.option("-q", "--quiet", is_flag=True, help="Suppress progress; emit output paths only.")
 @click.option("--verbose", is_flag=True, help="Verbose logging.")
 def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess, quiet, verbose):
-    """Process a PDF or image directory."""
+    """Process a PDF (or a directory of page images / a tree of PDFs)."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
@@ -62,21 +69,34 @@ def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess,
         if not avail.ok:
             raise click.ClickException(f"backend '{backend}' unavailable: {avail.reason}")
 
-    if not quiet:
-        click.echo(f"qwen-ocr: backend={engine.name} dpi={dpi} → {output}")
-
     params = InferenceParams()
-    results = process(Path(source), Path(output), engine, params, dpi, reprocess)
+    try:
+        outcome = process(
+            Path(source), engine, params, dpi,
+            output_dir=Path(output) if output else None,
+            reprocess=reprocess,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
-    ok = sum(1 for r in results if r.ok)
-    if not quiet:
-        click.echo(f"  {ok}/{len(results)} pages succeeded")
-    for r in results:
-        if not r.ok:
-            click.echo(f"  [fail] {r.stem}: {r.error}", err=True)
+    total = outcome.completed + outcome.failed + outcome.partial
+    if quiet:
+        # Scripting contract: one output .md path per line on stdout.
+        for path in outcome.outputs:
+            click.echo(path)
+    else:
+        click.echo(f"qwen-ocr: backend={engine.name} dpi={dpi}")
+        click.echo(f"  {outcome.completed}/{total} document(s) completed")
+        if outcome.has_failures:
+            click.echo(
+                f"  {outcome.failed} failed, {outcome.partial} partial: "
+                + ", ".join(outcome.failures),
+                err=True,
+            )
 
-    if ok == 0:
-        sys.exit(1)
+    # Uniform exit policy (canon SYS-02): nonzero if any document/page failed.
+    if outcome.exit_code != 0:
+        sys.exit(outcome.exit_code)
 
 
 # socr's BaseEngine calls the subcommand `process`; expose it under that name.
