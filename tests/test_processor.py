@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import fitz
-from ocr_output_contract import Status
+from ocr_output_contract import UNREADABLE_CHECKSUM, Status
 from PIL import Image
 
 from qwen_ocr.backends.base import Availability, Backend
@@ -245,6 +245,9 @@ def test_unreadable_input_recorded_failed_batch_continues(tmp_path):
 
     os.chmod(bad, 0)  # unreadable at checksum time
     try:
+        # Capture whether chmod(0) actually denied reads in THIS run (it does not
+        # when running as root, e.g. some CI), before permissions are restored.
+        bad_was_unreadable = not os.access(bad, os.R_OK)
         outcome = process(root, FakeBackend("x"), InferenceParams(), dpi=120, output_dir=out)
     finally:
         os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)  # restore for cleanup
@@ -258,6 +261,12 @@ def test_unreadable_input_recorded_failed_batch_continues(tmp_path):
     bad_meta = json.loads((out / "b" / "metadata.json").read_text())
     assert bad_meta["status"] == "failed"
     assert "unreadable" in (bad_meta["error"] or "")
+    # v0.1.3: a failure record must carry a VALID ``sha256:`` checksum (the
+    # conformance harness rejects None/""), so the unreadable-input fallback is
+    # the ``sha256:`` UNREADABLE_CHECKSUM sentinel.
+    assert bad_meta["checksum"].startswith("sha256:")
+    if bad_was_unreadable:
+        assert bad_meta["checksum"] == UNREADABLE_CHECKSUM
 
 
 def test_image_dir_default_output_idempotent_on_rerun(tmp_path):

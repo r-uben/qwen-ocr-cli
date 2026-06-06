@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ocr_output_contract import (
+    UNREADABLE_CHECKSUM,
     DocMetadata,
     RootIndex,
     RunOutcome,
@@ -266,11 +267,16 @@ def _build_doc_metadata(
         elif result.error:
             error = result.error
     # Tolerant checksum so persisting a status=failed record never itself throws
-    # when the input became unreadable mid-run. An empty sentinel never matches a
-    # real sha256:... checksum, so a failed entry is never wrongly skipped later.
+    # when the input became unreadable mid-run. Fall back to the canonical
+    # ``sha256:`` UNREADABLE_CHECKSUM sentinel (v0.1.3) instead of "" — the
+    # conformance harness requires a ``sha256:`` checksum even on a failure record.
+    # The sentinel never matches a real sha256:... digest, so a failed entry is
+    # never wrongly skipped later and a readable re-run reprocesses. (This is
+    # failure_checksum's logic generalized to qwen's two input shapes:
+    # _safe_doc_checksum handles both the single-file and image-directory cases.)
     return DocMetadata(
         status=status,
-        checksum=_safe_doc_checksum(result.source) or "",
+        checksum=_safe_doc_checksum(result.source) or UNREADABLE_CHECKSUM,
         model=_backend_model(backend),
         backend=backend.name,
         processing_time=result.processing_time,
