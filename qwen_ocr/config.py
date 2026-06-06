@@ -24,8 +24,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = os.environ.get("QWEN_OCR_API_MODEL", "qwen/qwen3.5-vl-plus")
 
 # --- Inference parameters (tunable; resolution matters more than people think) ---
-DEFAULT_DPI = 300          # higher than socr's 200 — validated lever for local OCR quality
-MAX_IMAGE_SIDE = 4000      # downscale longest side before sending (token/cost guard)
+DEFAULT_DPI = 300  # higher than socr's 200 — validated lever for local OCR quality
+MAX_IMAGE_SIDE = 4000  # downscale longest side before sending (token/cost guard)
 MAX_OUTPUT_TOKENS = 8192
 TEMPERATURE = 0.0
 # Neutral (1.0) by design: a repetition penalty CORRUPTS OCR of tables/forms, whose

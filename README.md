@@ -24,24 +24,40 @@ uv tool install --editable .       # exposes the `qwen-ocr` command
 
 ```bash
 # Auto backend: probe what's live, pick the best available
-qwen-ocr process paper.pdf -o ./out
+qwen-ocr process paper.pdf                              # default output: ./ocr/
 
-# Force a backend
+# Override the output root (-o is optional, never required)
 qwen-ocr process paper.pdf -o ./out --backend ollama   # local, free, private
 qwen-ocr process scans/      -o ./out --backend api     # cloud, best quality
 qwen-ocr process scans/      -o ./out --backend vllm    # self-hosted GPU
 
 # Steer auto-selection by what you care about
-qwen-ocr process paper.pdf -o ./out --prefer cost       # free backends first (default)
-qwen-ocr process paper.pdf -o ./out --prefer quality    # cloud 397B first
+qwen-ocr process paper.pdf --prefer cost                # free backends first (default)
+qwen-ocr process paper.pdf --prefer quality             # cloud 397B first
 
 qwen-ocr backends                                        # show which backends are live
 qwen-ocr --version
 ```
 
-Input may be a **PDF** or a **directory of page images** (`socr` renders pages to PNGs and
-passes the directory). Output is written as `{out}/{stem}/{stem}.md`, one markdown file per
-input — the layout `socr`'s adapter reads back.
+Input may be a **PDF**, a **directory of page images** (`socr` renders pages to PNGs and
+passes the directory, treated as one document), or a **tree of PDFs** (batch).
+
+## Output contract
+
+qwen emits the family-wide [`ocr-output-contract`](https://github.com/r-uben/ocr-output-contract)
+layout, byte-structure-identical to its sibling engines:
+
+- **Output root** defaults to `<input-parent>/ocr/`; `-o` overrides it but is never required.
+- **One aggregated `<root>/<rel/dir>/<stem>/<stem>.md` per document**, with every page under
+  a `## Page N` header (no per-page folders — a multi-page PDF is a single file).
+- **Clean markdown body**, no YAML frontmatter; all provenance lives in the metadata sidecar.
+- **Metadata at both levels**: a per-document `<stem>/metadata.json` plus a rolled-up root
+  `metadata.json` keyed by input-relative path (so same-basename files in different subdirs
+  never collide). Failures are recorded with `status="failed"`.
+- **Exit code** is nonzero if any document or page failed (uniform single-file and batch). An
+  empty/whitespace model response is a per-page *failure*, never a silent 0-byte success.
+- **Figures**: qwen extracts none (it is a text-OCR engine); it never fabricates a `figures/`
+  dir rather than silently differing from engines that do.
 
 ## Backends
 

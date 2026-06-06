@@ -9,7 +9,15 @@ from __future__ import annotations
 
 
 def sanitize_filename(name: str) -> str:
-    """Match socr's BaseEngine.sanitize_filename so output stems line up."""
+    """Sanitize a stem for use as a *temp render PNG* name only.
+
+    Output paths are owned by ``ocr-output-contract`` and are deliberately
+    stem-preserving (no sanitization), so this is NOT applied to the output
+    ``<stem>/<stem>.md`` path. It is used only to name the intermediate per-page
+    PNGs ``_render_pdf`` writes into a TemporaryDirectory, where a filesystem-safe
+    name avoids issues with odd source stems (the contract keys output off the
+    raw input-relative path regardless).
+    """
     return "".join(c if c.isalnum() or c in "._- " else "_" for c in name).strip()
 
 

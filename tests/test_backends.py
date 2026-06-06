@@ -16,6 +16,7 @@ from qwen_ocr.config import InferenceParams
 
 # --- availability probes ---
 
+
 def test_vllm_unavailable_without_url(monkeypatch):
     b = VLLMBackend(base_url="")
     assert not b.is_available()
@@ -41,7 +42,8 @@ def test_api_prefers_dashscope(monkeypatch):
 def test_ollama_reports_missing_model(monkeypatch):
     def fake_get(url, timeout):
         return httpx.Response(
-            200, json={"models": [{"name": "llama3:latest"}]},
+            200,
+            json={"models": [{"name": "llama3:latest"}]},
             request=httpx.Request("GET", url),
         )
 
@@ -54,7 +56,8 @@ def test_ollama_reports_missing_model(monkeypatch):
 def test_ollama_matches_model_with_tag(monkeypatch):
     def fake_get(url, timeout):
         return httpx.Response(
-            200, json={"models": [{"name": "qwen3-vl:latest"}]},
+            200,
+            json={"models": [{"name": "qwen3-vl:latest"}]},
             request=httpx.Request("GET", url),
         )
 
@@ -67,7 +70,8 @@ def test_ollama_endpoint_sends_resolved_tag(monkeypatch):
     # ("qwen3-vl:8b"), else Ollama 404s on an unresolvable model.
     def fake_get(url, timeout):
         return httpx.Response(
-            200, json={"models": [{"name": "qwen3-vl:8b"}]},
+            200,
+            json={"models": [{"name": "qwen3-vl:8b"}]},
             request=httpx.Request("GET", url),
         )
 
@@ -78,6 +82,7 @@ def test_ollama_endpoint_sends_resolved_tag(monkeypatch):
 
 
 # --- image encoding + response parsing ---
+
 
 def test_encode_image_downscales(tmp_path):
     from io import BytesIO
@@ -112,7 +117,8 @@ def test_ocr_image_posts_and_parses(monkeypatch, tmp_path):
         captured["url"] = url
         captured["model"] = json["model"]
         return httpx.Response(
-            200, json={"choices": [{"message": {"content": "ok text"}}]},
+            200,
+            json={"choices": [{"message": {"content": "ok text"}}]},
             request=httpx.Request("POST", url),
         )
 

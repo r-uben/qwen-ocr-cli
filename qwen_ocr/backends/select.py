@@ -56,6 +56,5 @@ def resolve_backend(prefer: str = "cost", model: str | None = None) -> Backend:
         reasons.append(f"  {name}: {avail.reason}")
 
     raise RuntimeError(
-        "no Qwen-VL backend available. Tried (prefer=" + prefer + "):\n"
-        + "\n".join(reasons)
+        "no Qwen-VL backend available. Tried (prefer=" + prefer + "):\n" + "\n".join(reasons)
     )
