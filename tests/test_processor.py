@@ -79,6 +79,124 @@ def test_image_dir_is_one_document(tmp_path):
     assert body.count("## Page ") == 3
 
 
+def test_mixed_dir_pdf_and_stray_image_processes_pdf(tmp_path):
+    # A dir holding a PDF + a loose top-level image is a BATCH tree: the PDF must
+    # be OCR'd, not silently folded into one bogus image-dir document (regression
+    # guard for the MEDIUM mixed-dir data-loss bug).
+    src = tmp_path / "mixed"
+    src.mkdir()
+    _make_pdf(src / "real.pdf", pages=1)
+    Image.new("RGB", (50, 50), "white").save(src / "cover.png")
+    out = tmp_path / "out"
+
+    backend = FakeBackend("body")
+    outcome = process(src, backend, InferenceParams(), dpi=120, output_dir=out)
+
+    assert outcome.exit_code == 0
+    # The PDF was processed to its own <stem>/<stem>.md ...
+    assert (out / "real" / "real.md").exists()
+    # ... and the dir was NOT treated as a single image-dir document.
+    assert not (out / "mixed" / "mixed.md").exists()
+    root = json.loads((out / "metadata.json").read_text())
+    assert "real.pdf" in root["files"]
+
+
+def test_pure_image_dir_still_one_document(tmp_path):
+    # A directory of ONLY page images is still one image-dir document (socr path).
+    src = tmp_path / "scan"
+    src.mkdir()
+    for n in (1, 2):
+        Image.new("RGB", (50, 50), "white").save(src / f"page_{n:04d}.png")
+    out = tmp_path / "out"
+
+    outcome = process(src, FakeBackend("# ok"), InferenceParams(), dpi=120, output_dir=out)
+    assert outcome.exit_code == 0
+    assert (out / "scan" / "scan.md").exists()
+
+
+def test_page_image_dir_ignores_os_junk(tmp_path):
+    # A .DS_Store next to page images must not demote the dir out of image-doc mode.
+    src = tmp_path / "scan"
+    src.mkdir()
+    for n in (1, 2):
+        Image.new("RGB", (50, 50), "white").save(src / f"page_{n:04d}.png")
+    (src / ".DS_Store").write_bytes(b"\x00\x01")
+    out = tmp_path / "out"
+
+    outcome = process(src, FakeBackend("# ok"), InferenceParams(), dpi=120, output_dir=out)
+    assert outcome.exit_code == 0
+    assert (out / "scan" / "scan.md").exists()
+
+
+def test_default_output_root_not_self_ingested_on_rerun(tmp_path):
+    # The default <input>/ocr/ root sits inside the scanned tree; a re-run must not
+    # re-discover its own outputs as fresh inputs (iter_input_files prunes it).
+    src = tmp_path / "papers"
+    src.mkdir()
+    _make_pdf(src / "a.pdf", pages=1)
+
+    b1 = FakeBackend("x")
+    out1 = process(src, b1, InferenceParams(), dpi=120)  # default -> papers/ocr/
+    assert out1.completed == 1
+    assert (src / "ocr" / "a" / "a.md").exists()
+
+    # Second run: only the one PDF is rediscovered (skipped), no stray .md inputs.
+    b2 = FakeBackend("x")
+    out2 = process(src, b2, InferenceParams(), dpi=120)
+    assert b2.calls == 0
+    assert out2.completed == 1  # exactly the one real input, not its outputs
+
+
+def test_quiet_skip_emits_existing_md_path(tmp_path):
+    # Cached-skip must emit the existing .md path (quiet-mode scripting contract).
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    first = process(pdf, FakeBackend("hi"), InferenceParams(), dpi=120, output_dir=out)
+    assert first.outputs == [str(out / "doc" / "doc.md")]
+
+    # Re-run: skipped, but the existing .md path is still emitted (not empty).
+    b2 = FakeBackend("hi")
+    second = process(pdf, b2, InferenceParams(), dpi=120, output_dir=out)
+    assert b2.calls == 0
+    assert second.completed == 1
+    assert second.outputs == [str(out / "doc" / "doc.md")]
+
+
+def test_deleted_md_forces_reprocess(tmp_path):
+    # v0.1.1 is_completed verifies the .md on disk: a deleted output is re-emitted.
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    process(pdf, FakeBackend("hi"), InferenceParams(), dpi=120, output_dir=out)
+    (out / "doc" / "doc.md").unlink()  # index survives, .md gone
+
+    b2 = FakeBackend("again")
+    process(pdf, b2, InferenceParams(), dpi=120, output_dir=out)
+    assert b2.calls == 1  # NOT skipped despite the surviving index entry
+    assert (out / "doc" / "doc.md").exists()
+
+
+def test_model_change_invalidates_cache(tmp_path):
+    # Run fingerprint: a re-run under a different model reprocesses (no stale reuse).
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    process(pdf, FakeBackend("v1"), InferenceParams(), dpi=120, output_dir=out)
+
+    class OtherModel(FakeBackend):
+        def _endpoint(self):
+            return ("http://x/v1", None, "different-model")
+
+    b2 = OtherModel("v2")
+    outcome = process(pdf, b2, InferenceParams(), dpi=120, output_dir=out)
+    assert b2.calls == 1  # different model -> reprocessed, not skipped
+    assert outcome.completed == 1
+
+
 def test_default_output_root_is_input_parent_ocr(tmp_path):
     # No -o: default is <input-parent>/ocr/ (never required).
     pdf = tmp_path / "doc.pdf"

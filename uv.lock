@@ -102,8 +102,8 @@ wheels = [
 
 [[package]]
 name = "ocr-output-contract"
-version = "0.1.0"
-source = { git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.0#6e684de97d0ac484ecd8b1ae70c68a8b56d65413" }
+version = "0.1.1"
+source = { git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.1#14d43eb0ffcab545c5cb4e6228001f10e783856d" }
 
 [[package]]
 name = "packaging"
@@ -273,7 +273,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "ocr-output-contract", git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.0" },
+    { name = "ocr-output-contract", git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.1" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pymupdf", specifier = ">=1.24" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

@@ -172,3 +172,27 @@ def test_image_dir_document_conforms(tmp_path):
         out,
         [ExpectedDoc(rel_key="scan", pages=2, status="completed")],
     )
+
+
+def test_mixed_dir_pdf_conforms_pdf_not_dropped(tmp_path):
+    """A dir with a PDF + a stray image is a batch: the PDF is OCR'd and conforms.
+
+    Regression guard for the MEDIUM mixed-dir bug: the directory must NOT be
+    treated as one bogus image-dir document (which silently dropped the PDF).
+    """
+    from PIL import Image
+
+    src = tmp_path / "mixed"
+    src.mkdir()
+    _make_pdf(src / "real.pdf", pages=2)
+    Image.new("RGB", (60, 60), "white").save(src / "cover.png")
+    out = tmp_path / "out"
+
+    outcome = process(src, FakeBackend(), InferenceParams(), dpi=120, output_dir=out)
+    assert outcome.exit_code == 0
+
+    # The real PDF is a conforming document under its input-relative key.
+    assert_conforms(
+        out,
+        [ExpectedDoc(rel_key="real.pdf", pages=2, status="completed")],
+    )

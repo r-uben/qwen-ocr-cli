@@ -31,9 +31,12 @@ from ocr_output_contract import (
     Status,
     assemble_pages,
     doc_dir_for,
+    is_within_output_root,
+    iter_input_files,
     markdown_path_for,
     relative_key,
     resolve_output_root,
+    run_fingerprint,
     sha256_checksum,
     utc_timestamp,
     write_doc_metadata,
@@ -186,6 +189,18 @@ def _backend_model(backend: Backend) -> str:
         return getattr(backend, "model", "") or ""
 
 
+def _backend_fingerprint(backend: Backend) -> str:
+    """Run-config fingerprint so a re-run under a different model/backend reprocesses.
+
+    qwen has no task/prompt selector (it OCRs each page with the backend's default
+    prompt), so only model + backend vary the output for a given input. The
+    contract's :func:`run_fingerprint` is stored in the doc metadata and consulted
+    by :meth:`RootIndex.is_completed`, so changing ``--model`` or the backend
+    invalidates a cached result instead of silently reusing it.
+    """
+    return run_fingerprint(_backend_model(backend), backend.name)
+
+
 def _doc_checksum(source: Path) -> str:
     """Content checksum for idempotency. Hash a PDF's bytes, or an image dir's.
 
@@ -227,6 +242,7 @@ def _build_doc_metadata(
         output_path=str(markdown_path.relative_to(output_root)),
         pages=result.page_count,
         error=error,
+        fingerprint=_backend_fingerprint(backend),
     )
 
 
@@ -279,24 +295,35 @@ def process(
     Returns a :class:`RunOutcome` whose ``exit_code`` is nonzero if any
     document/page failed (uniform across single-file and batch).
     """
-    documents = _discover_documents(source)
+    # Resolve the output root BEFORE discovery so the recursive batch scan can
+    # prune the engine's own ``ocr/`` output subtree (no self-ingestion on re-run).
+    output_root = resolve_output_root(source, output_dir)
+    documents, single_image_dir = _discover_documents(source, output_root)
     if not documents:
         raise ValueError(f"no documents found at {source}")
 
-    output_root = resolve_output_root(source, output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     # A single image-dir document keys on its own folder name (an image dir has
     # no file stem); a batch tree keys each .pdf input-relative to the tree root.
-    single_image_dir = len(documents) == 1 and documents[0] == source and source.is_dir()
     scan_root = source.parent if (source.is_file() or single_image_dir) else source
     index = RootIndex(output_root)
+    fingerprint = _backend_fingerprint(backend)
 
     outcome = RunOutcome()
     for doc in documents:
         rel_key = relative_key(doc, scan_root)
-        if not reprocess and index.is_completed(rel_key, _doc_checksum(doc)):
+        if not reprocess and index.is_completed(
+            rel_key, _doc_checksum(doc), fingerprint=fingerprint
+        ):
             logger.info("skip %s (already completed; use --reprocess)", rel_key)
-            outcome.add(Status.COMPLETED)
+            # Quiet-mode scripting contract: emit the existing .md path for a
+            # skipped-but-present doc (v0.1.1 is_completed already verified it
+            # exists on disk, but recompute + re-check defensively).
+            skip_md = markdown_path_for(doc_dir_for(output_root, rel_key), rel_key)
+            outcome.add(
+                Status.COMPLETED,
+                output_path=str(skip_md) if skip_md.exists() else None,
+            )
             continue
 
         result = _ocr_one_document(doc, backend, params, dpi)
@@ -310,21 +337,51 @@ def process(
     return outcome
 
 
-def _discover_documents(source: Path) -> list[Path]:
-    """Return the list of source documents under ``source``.
+def _is_page_image_dir(source: Path) -> bool:
+    """True if ``source`` directly contains ONLY page images (no PDFs, no junk).
 
-    A bare ``.pdf`` is one document. A directory is treated as a SINGLE image-dir
-    document when it directly contains page images (socr renders a PDF to PNGs
-    and passes the dir); otherwise it is a batch tree and every ``.pdf`` under it
-    (recursively) is one document.
+    This is the ONLY shape qwen treats as a single image-directory document: the
+    pure page-image dir socr renders a PDF into (``page_0001.png`` ...). Dotfiles
+    and OS junk (``.DS_Store``, ``Thumbs.db``) are ignored so they don't demote a
+    clean scan dir. A directory that also holds a PDF (or any non-image,
+    non-junk file) is NOT a single image-doc — it is a batch tree (see
+    :func:`_discover_documents`), so a co-located PDF is never silently dropped.
+    """
+    saw_image = False
+    for p in source.iterdir():
+        if p.name.startswith(".") or p.name in {"Thumbs.db", "thumbs.db"}:
+            continue  # OS/editor junk: ignore for classification
+        if not p.is_file():
+            return False  # a subdirectory means a batch tree, not a flat scan
+        if p.suffix.lower() in _IMAGE_SUFFIXES:
+            saw_image = True
+            continue
+        return False  # any non-image file (e.g. a PDF) -> treat the dir as a batch
+    return saw_image
+
+
+def _discover_documents(source: Path, output_root: Path) -> tuple[list[Path], bool]:
+    """Return ``(documents, single_image_dir)`` for an input path.
+
+    * A bare file is one document.
+    * A directory containing ONLY page images is a SINGLE image-dir document
+      (the pure ``page_0001.png`` ... dir socr passes). Returns
+      ``single_image_dir=True`` so the caller keys it on the folder name.
+    * Any other directory is a BATCH tree: every ``.pdf`` under it (recursively)
+      is one document, discovered via the contract's :func:`iter_input_files`,
+      which excludes the resolved ``output_root`` so the engine never re-ingests
+      its own ``ocr/`` outputs on a re-run. A directory holding a PDF alongside
+      loose images takes this path, so the PDF is OCR'd (the loose images, which
+      have no document identity, are not folded into a bogus single doc).
     """
     if source.is_file():
-        return [source]
+        return [source], False
     if source.is_dir():
-        has_direct_images = any(
-            p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES for p in source.iterdir()
-        )
-        if has_direct_images:
-            return [source]
-        return sorted(p for p in source.rglob("*") if p.suffix.lower() in _DOC_SUFFIXES)
-    return []
+        # The output root itself is never a source document.
+        if is_within_output_root(source, output_root):
+            return [], False
+        if _is_page_image_dir(source):
+            return [source], True
+        docs = list(iter_input_files(source, output_root, _DOC_SUFFIXES))
+        return docs, False
+    return [], False
