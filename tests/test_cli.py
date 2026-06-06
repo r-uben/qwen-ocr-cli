@@ -97,6 +97,23 @@ def test_quiet_emits_output_paths(monkeypatch, tmp_path):
     assert str(out / "doc" / "doc.md") in res.output
 
 
+def test_quiet_failure_diagnostics_go_to_stderr(monkeypatch, tmp_path):
+    # Under -q, failure diagnostics must still reach stderr (socr reads stderr on
+    # a nonzero exit); stdout stays clean (paths only).
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(cli, "make_backend", lambda name, model=None: FakeBackend(text=""))
+
+    res = CliRunner().invoke(
+        cli.main, ["process", str(pdf), "-o", str(out), "--backend", "ollama", "-q"]
+    )
+    assert res.exit_code != 0
+    assert "failed" in res.stderr  # the failure summary reached stderr under -q
+    assert "failed" not in res.stdout  # stdout stays clean for scripting
+
+
 def test_empty_response_exits_nonzero(monkeypatch, tmp_path):
     # QWEN-02 at the CLI boundary: an empty page → nonzero exit.
     pdf = tmp_path / "doc.pdf"

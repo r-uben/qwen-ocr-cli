@@ -197,6 +197,91 @@ def test_model_change_invalidates_cache(tmp_path):
     assert outcome.completed == 1
 
 
+def test_dpi_change_invalidates_cache(tmp_path):
+    # v0.1.2: --dpi is an output-affecting flag folded into the run fingerprint,
+    # so re-rendering the same PDF at a different DPI reprocesses (no stale reuse).
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    process(pdf, FakeBackend("v1"), InferenceParams(), dpi=120, output_dir=out)
+
+    b2 = FakeBackend("v2")
+    process(pdf, b2, InferenceParams(), dpi=120, output_dir=out)
+    assert b2.calls == 0  # same dpi -> skipped
+
+    b3 = FakeBackend("v3")
+    process(pdf, b3, InferenceParams(), dpi=300, output_dir=out)
+    assert b3.calls == 1  # different dpi -> reprocessed, not skipped
+
+
+def test_inference_params_change_invalidates_cache(tmp_path):
+    # Output-affecting inference params (e.g. prompt) are in the fingerprint too.
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    process(pdf, FakeBackend("v1"), InferenceParams(), dpi=120, output_dir=out)
+
+    b2 = FakeBackend("v2")
+    other = InferenceParams(prompt="a different OCR prompt")
+    process(pdf, b2, other, dpi=120, output_dir=out)
+    assert b2.calls == 1  # changed prompt -> reprocessed
+
+
+def test_unreadable_input_recorded_failed_batch_continues(tmp_path):
+    # SYS-02 via v0.1.2 safe_checksum: an input unreadable at the idempotency
+    # pre-check is recorded status=failed and the batch CONTINUES (no abort).
+    import os
+    import stat
+
+    root = tmp_path / "in"
+    root.mkdir()
+    _make_pdf(root / "a.pdf", pages=1)
+    bad = root / "b.pdf"
+    _make_pdf(bad, pages=1)
+    _make_pdf(root / "c.pdf", pages=1)
+    out = tmp_path / "out"
+
+    os.chmod(bad, 0)  # unreadable at checksum time
+    try:
+        outcome = process(root, FakeBackend("x"), InferenceParams(), dpi=120, output_dir=out)
+    finally:
+        os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)  # restore for cleanup
+
+    # The two good files were processed; the bad one is recorded failed, no abort.
+    assert outcome.completed == 2
+    assert outcome.failed == 1
+    assert outcome.exit_code != 0
+    assert (out / "a" / "a.md").exists()
+    assert (out / "c" / "c.md").exists()
+    bad_meta = json.loads((out / "b" / "metadata.json").read_text())
+    assert bad_meta["status"] == "failed"
+    assert "unreadable" in (bad_meta["error"] or "")
+
+
+def test_image_dir_default_output_idempotent_on_rerun(tmp_path):
+    # The default <input>/ocr/ root lands INSIDE the scanned image dir; a re-run
+    # must still classify it as one image-dir document (not demote it to a batch
+    # tree that finds no .pdf and raises "no documents found").
+    src = tmp_path / "scan"
+    src.mkdir()
+    for n in (1, 2):
+        Image.new("RGB", (40, 40), "white").save(src / f"page_{n:04d}.png")
+
+    b1 = FakeBackend("ok")
+    out1 = process(src, b1, InferenceParams(), dpi=120)  # default -> scan/ocr/
+    assert out1.completed == 1
+    assert (src / "ocr" / "scan" / "scan.md").exists()
+
+    # Second run: the freshly-created ocr/ subdir must NOT demote the scan to a
+    # batch tree; the same image-dir document is rediscovered and skipped.
+    b2 = FakeBackend("ok")
+    out2 = process(src, b2, InferenceParams(), dpi=120)
+    assert b2.calls == 0  # skipped (already completed), not re-OCR'd
+    assert out2.completed == 1  # not "no documents found"
+
+
 def test_default_output_root_is_input_parent_ocr(tmp_path):
     # No -o: default is <input-parent>/ocr/ (never required).
     pdf = tmp_path / "doc.pdf"

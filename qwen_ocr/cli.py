@@ -65,7 +65,13 @@ def main() -> None:
     show_default=True,
     help="Render DPI for PDF pages.",
 )
-@click.option("-w", "--workers", type=int, default=1, help="Reserved for parallel pages.")
+@click.option(
+    "-w",
+    "--workers",
+    type=int,
+    default=1,
+    help="Accepted for socr compatibility; currently a no-op (pages OCR sequentially).",
+)
 @click.option("--reprocess", is_flag=True, help="Re-OCR documents already recorded completed.")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress; emit output paths only.")
 @click.option("--verbose", is_flag=True, help="Verbose logging.")
@@ -111,12 +117,16 @@ def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess,
     else:
         click.echo(f"qwen-ocr: backend={engine.name} dpi={dpi}")
         click.echo(f"  {outcome.completed}/{total} document(s) completed")
-        if outcome.has_failures:
-            click.echo(
-                f"  {outcome.failed} failed, {outcome.partial} partial: "
-                + ", ".join(outcome.failures),
-                err=True,
-            )
+
+    # Failure diagnostics ALWAYS go to stderr, even under -q: socr reads stderr on
+    # a nonzero exit, and a quiet scripting user still needs to know what failed.
+    # stdout stays clean (paths only) under -q.
+    if outcome.has_failures:
+        click.echo(
+            f"qwen-ocr: {outcome.failed} failed, {outcome.partial} partial: "
+            + ", ".join(outcome.failures),
+            err=True,
+        )
 
     # Uniform exit policy (canon SYS-02): nonzero if any document/page failed.
     if outcome.exit_code != 0:

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "ocr-output-contract @ git+https://github.com/r-uben/ocr-output-contract@v0.1.1",
+    "ocr-output-contract @ git+https://github.com/r-uben/ocr-output-contract@v0.1.2",
     "click>=8.1",
     "httpx>=0.27",
     "pymupdf>=1.24",

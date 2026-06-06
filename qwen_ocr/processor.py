@@ -37,6 +37,7 @@ from ocr_output_contract import (
     relative_key,
     resolve_output_root,
     run_fingerprint,
+    safe_checksum,
     sha256_checksum,
     utc_timestamp,
     write_doc_metadata,
@@ -189,16 +190,27 @@ def _backend_model(backend: Backend) -> str:
         return getattr(backend, "model", "") or ""
 
 
-def _backend_fingerprint(backend: Backend) -> str:
-    """Run-config fingerprint so a re-run under a different model/backend reprocesses.
+def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str:
+    """Run-config fingerprint so a re-run under different output-affecting flags reprocesses.
 
-    qwen has no task/prompt selector (it OCRs each page with the backend's default
-    prompt), so only model + backend vary the output for a given input. The
-    contract's :func:`run_fingerprint` is stored in the doc metadata and consulted
-    by :meth:`RootIndex.is_completed`, so changing ``--model`` or the backend
-    invalidates a cached result instead of silently reusing it.
+    qwen has no task selector, but its page text genuinely depends on more than
+    model + backend: the render ``--dpi`` (resolution at which the PDF is
+    rasterized) and the :class:`InferenceParams` (prompt, token budget,
+    temperature, repetition penalty, max image side) all change what OCR a given
+    input produces. v0.1.2's ``run_fingerprint(extra=...)`` folds these RESOLVED
+    flags into the fingerprint, which :meth:`RootIndex.is_completed` consults, so
+    re-running the same input at a different ``--dpi`` (or with changed inference
+    params) reprocesses instead of silently reusing stale lower-res OCR.
     """
-    return run_fingerprint(_backend_model(backend), backend.name)
+    extra = {
+        "dpi": dpi,
+        "max_output_tokens": params.max_output_tokens,
+        "temperature": params.temperature,
+        "repetition_penalty": params.repetition_penalty,
+        "max_image_side": params.max_image_side,
+        "prompt": params.prompt,
+    }
+    return run_fingerprint(_backend_model(backend), backend.name, extra=extra)
 
 
 def _doc_checksum(source: Path) -> str:
@@ -218,11 +230,32 @@ def _doc_checksum(source: Path) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
+def _safe_doc_checksum(source: Path) -> str | None:
+    """Tolerant :func:`_doc_checksum`: ``None`` instead of raising on bad input.
+
+    A document discovered during the batch scan can be unreadable by the time it
+    is processed (permission denied, deleted/replaced mid-run, a broken symlink
+    that passed discovery). Returning ``None`` lets the caller record that one
+    doc as a per-file FAILURE and CONTINUE the batch, rather than letting an
+    ``OSError`` propagate and abort the whole run (the SYS-02 "one bad file
+    aborts the batch" failure mode). Mirrors the contract's
+    :func:`safe_checksum` for the single-file case and extends the tolerance to
+    the image-directory case.
+    """
+    try:
+        if source.is_file():
+            return safe_checksum(source)
+        return _doc_checksum(source)
+    except OSError:
+        return None
+
+
 def _build_doc_metadata(
     result: DocResult,
     markdown_path: Path,
     output_root: Path,
     backend: Backend,
+    fingerprint: str,
 ) -> DocMetadata:
     """Assemble the per-document metadata record from a DocResult."""
     status = result.status
@@ -232,9 +265,12 @@ def _build_doc_metadata(
             error = "; ".join(f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items()))
         elif result.error:
             error = result.error
+    # Tolerant checksum so persisting a status=failed record never itself throws
+    # when the input became unreadable mid-run. An empty sentinel never matches a
+    # real sha256:... checksum, so a failed entry is never wrongly skipped later.
     return DocMetadata(
         status=status,
-        checksum=_doc_checksum(result.source),
+        checksum=_safe_doc_checksum(result.source) or "",
         model=_backend_model(backend),
         backend=backend.name,
         processing_time=result.processing_time,
@@ -242,7 +278,7 @@ def _build_doc_metadata(
         output_path=str(markdown_path.relative_to(output_root)),
         pages=result.page_count,
         error=error,
-        fingerprint=_backend_fingerprint(backend),
+        fingerprint=fingerprint,
     )
 
 
@@ -252,12 +288,15 @@ def _write_document(
     rel_key: str,
     backend: Backend,
     index: RootIndex,
+    fingerprint: str,
 ) -> tuple[DocMetadata, Path]:
     """Write the aggregated markdown + BOTH metadata levels for one document.
 
     Output is always written (even on failure) so failures are recorded with
     ``status=failed`` per the canon. The single ``<stem>/<stem>.md`` aggregates
-    every page under ``## Page N`` headers (fixes QWEN-01).
+    every page under ``## Page N`` headers (fixes QWEN-01). ``fingerprint`` is the
+    run-config fingerprint recorded so a re-run under different output-affecting
+    flags reprocesses (must match the one used for the skip pre-check).
     """
     doc_dir = doc_dir_for(output_root, rel_key)
     doc_dir.mkdir(parents=True, exist_ok=True)
@@ -266,7 +305,7 @@ def _write_document(
     body = assemble_pages(result.pages) if result.pages else "*[OCR Failed]*\n"
     markdown_path.write_text(body, encoding="utf-8")
 
-    meta = _build_doc_metadata(result, markdown_path, output_root, backend)
+    meta = _build_doc_metadata(result, markdown_path, output_root, backend, fingerprint)
     write_doc_metadata(doc_dir, rel_key, meta)
     index.record(rel_key, meta)
     return meta, markdown_path
@@ -307,14 +346,28 @@ def process(
     # no file stem); a batch tree keys each .pdf input-relative to the tree root.
     scan_root = source.parent if (source.is_file() or single_image_dir) else source
     index = RootIndex(output_root)
-    fingerprint = _backend_fingerprint(backend)
+    # Fingerprint covers all output-affecting flags (model, backend, dpi, inference
+    # params): a re-run at a different --dpi or with changed params reprocesses.
+    fingerprint = _run_fingerprint(backend, dpi, params)
 
     outcome = RunOutcome()
     for doc in documents:
         rel_key = relative_key(doc, scan_root)
-        if not reprocess and index.is_completed(
-            rel_key, _doc_checksum(doc), fingerprint=fingerprint
-        ):
+        # Tolerant checksum: an input unreadable at pre-check time (permission
+        # denied, deleted/replaced mid-run, broken symlink) is recorded as a
+        # per-file FAILURE and the batch CONTINUES, instead of an OSError
+        # aborting the whole run (SYS-02). v0.1.2's safe_checksum primitive.
+        checksum = _safe_doc_checksum(doc)
+        if checksum is None:
+            logger.error("input unreadable, recording failed: %s", rel_key)
+            result = DocResult(source=doc, pages=[], error="input unreadable (checksum failed)")
+            meta, markdown_path = _write_document(
+                result, output_root, rel_key, backend, index, fingerprint
+            )
+            outcome.add(meta.status, detail=rel_key, output_path=str(markdown_path))
+            continue
+
+        if not reprocess and index.is_completed(rel_key, checksum, fingerprint=fingerprint):
             logger.info("skip %s (already completed; use --reprocess)", rel_key)
             # Quiet-mode scripting contract: emit the existing .md path for a
             # skipped-but-present doc (v0.1.1 is_completed already verified it
@@ -327,7 +380,9 @@ def process(
             continue
 
         result = _ocr_one_document(doc, backend, params, dpi)
-        meta, markdown_path = _write_document(result, output_root, rel_key, backend, index)
+        meta, markdown_path = _write_document(
+            result, output_root, rel_key, backend, index, fingerprint
+        )
         outcome.add(
             meta.status,
             detail=None if meta.status is Status.COMPLETED else rel_key,
@@ -337,7 +392,7 @@ def process(
     return outcome
 
 
-def _is_page_image_dir(source: Path) -> bool:
+def _is_page_image_dir(source: Path, output_root: Path) -> bool:
     """True if ``source`` directly contains ONLY page images (no PDFs, no junk).
 
     This is the ONLY shape qwen treats as a single image-directory document: the
@@ -346,13 +401,21 @@ def _is_page_image_dir(source: Path) -> bool:
     clean scan dir. A directory that also holds a PDF (or any non-image,
     non-junk file) is NOT a single image-doc — it is a batch tree (see
     :func:`_discover_documents`), so a co-located PDF is never silently dropped.
+
+    The engine's OWN resolved output root (e.g. ``<source>/ocr/`` when ``-o`` is
+    omitted) is ignored for classification: otherwise the ``ocr/`` subdir created
+    by the first run would demote the same image dir to a "batch tree" on the
+    second run, where ``_DOC_SUFFIXES={.pdf}`` finds nothing and process() raises
+    "no documents found" — a documented invocation breaking on its second call.
     """
     saw_image = False
     for p in source.iterdir():
         if p.name.startswith(".") or p.name in {"Thumbs.db", "thumbs.db"}:
             continue  # OS/editor junk: ignore for classification
+        if is_within_output_root(p, output_root):
+            continue  # the engine's own output subtree: never demotes the scan
         if not p.is_file():
-            return False  # a subdirectory means a batch tree, not a flat scan
+            return False  # a (non-output) subdirectory means a batch tree
         if p.suffix.lower() in _IMAGE_SUFFIXES:
             saw_image = True
             continue
@@ -380,7 +443,7 @@ def _discover_documents(source: Path, output_root: Path) -> tuple[list[Path], bo
         # The output root itself is never a source document.
         if is_within_output_root(source, output_root):
             return [], False
-        if _is_page_image_dir(source):
+        if _is_page_image_dir(source, output_root):
             return [source], True
         docs = list(iter_input_files(source, output_root, _DOC_SUFFIXES))
         return docs, False
