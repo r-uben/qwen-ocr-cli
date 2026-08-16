@@ -197,7 +197,7 @@ def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str
     qwen has no task selector, but its page text genuinely depends on more than
     model + backend: the render ``--dpi`` (resolution at which the PDF is
     rasterized) and the :class:`InferenceParams` (prompt, token budget,
-    temperature, repetition penalty, max image side, thinking mode) all change what
+    temperature, repetition penalty, pixel budget, thinking mode) all change what
     OCR a given input produces. v0.1.2's ``run_fingerprint(extra=...)`` folds these RESOLVED
     flags into the fingerprint, which :meth:`RootIndex.is_completed` consults, so
     re-running the same input at a different ``--dpi`` (or with changed inference
@@ -208,7 +208,8 @@ def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str
         "max_output_tokens": params.max_output_tokens,
         "temperature": params.temperature,
         "repetition_penalty": params.repetition_penalty,
-        "max_image_side": params.max_image_side,
+        "min_pixels": params.min_pixels,
+        "max_pixels": params.max_pixels,
         "prompt": params.prompt,
         "enable_thinking": params.enable_thinking,
     }

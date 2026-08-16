@@ -71,6 +71,49 @@ def test_process_writes_canonical_output(monkeypatch, tmp_path):
     assert "## Page 1" in body and "## Page 2" in body
 
 
+def test_pixel_budget_is_reported_and_flags_thread_through(monkeypatch, tmp_path):
+    # Issue #5: the resolved budget must be visible, not implicit in a server default.
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf)
+    seen = {}
+
+    class Recording(FakeBackend):
+        def ocr_image(self, image_path, params):
+            seen["min"] = params.min_pixels
+            seen["max"] = params.max_pixels
+            return self.text
+
+    monkeypatch.setattr(cli, "make_backend", lambda name, model=None: Recording())
+    res = CliRunner().invoke(
+        cli.main,
+        [
+            "process",
+            str(pdf),
+            "-o",
+            str(tmp_path / "out"),
+            "--backend",
+            "ollama",
+            "--max-pixels",
+            "4194304",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert seen["max"] == 4194304
+    assert "pixels=" in res.output
+
+
+def test_inverted_pixel_budget_is_rejected(monkeypatch, tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf)
+    monkeypatch.setattr(cli, "make_backend", lambda name, model=None: FakeBackend())
+    res = CliRunner().invoke(
+        cli.main,
+        ["process", str(pdf), "--backend", "ollama", "--min-pixels", "999999999"],
+    )
+    assert res.exit_code != 0
+    assert "min-pixels" in res.output
+
+
 def test_output_not_required_defaults_to_input_parent_ocr(monkeypatch, tmp_path):
     # -o is NOT required (fixes qwen's "-o required" divergence).
     pdf = tmp_path / "doc.pdf"

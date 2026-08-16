@@ -25,7 +25,26 @@ OPENROUTER_MODEL = os.environ.get("QWEN_OCR_API_MODEL", "qwen/qwen3.5-vl-plus")
 
 # --- Inference parameters (tunable; resolution matters more than people think) ---
 DEFAULT_DPI = 300  # higher than socr's 200 — validated lever for local OCR quality
-MAX_IMAGE_SIDE = 4000  # downscale longest side before sending (token/cost guard)
+
+# Input pixel budget, from the official Qwen OCR cookbook
+# (QwenLM/Qwen3-VL, cookbooks/ocr.ipynb): min_pixels = 512*32*32, max_pixels = 2048*32*32.
+# 32 is Qwen3-VL's patch alignment (Qwen2.5-VL used 28). Cited constants, not tuning.
+#
+# Setting these explicitly is the point (issue #5): a 300-DPI A4 page is ~8.7 MP, ~4x the
+# ceiling, so without an explicit budget the *effective* resolution is whatever the
+# server-side processor's default happens to be — neither chosen nor recorded. qwen-ocr
+# resizes client-side to land inside the budget (utils.smart_resize), so the resolution
+# the model sees is decided here and logged per page, on every backend.
+#
+# The DPI interaction is deliberate: render at 300 and downsample with LANCZOS rather
+# than rasterizing straight to the budget — resampling from a high-res render antialiases
+# small glyphs (digits, minus signs, sub/superscripts) better than a low-DPI render.
+#
+# Raising the ceiling for dense-table work is a deliberate act: --max-pixels, or
+# QWEN_OCR_MAX_PIXELS in an environment (HPC job scripts) where flags are awkward.
+PATCH_FACTOR = 32
+MIN_PIXELS = int(os.environ.get("QWEN_OCR_MIN_PIXELS", 512 * PATCH_FACTOR * PATCH_FACTOR))
+MAX_PIXELS = int(os.environ.get("QWEN_OCR_MAX_PIXELS", 2048 * PATCH_FACTOR * PATCH_FACTOR))
 MAX_OUTPUT_TOKENS = 8192
 TEMPERATURE = 0.0
 # Neutral (1.0) by design: a repetition penalty CORRUPTS OCR of tables/forms, whose
@@ -57,7 +76,8 @@ class InferenceParams:
     max_output_tokens: int = MAX_OUTPUT_TOKENS
     temperature: float = TEMPERATURE
     repetition_penalty: float = REPETITION_PENALTY
-    max_image_side: int = MAX_IMAGE_SIDE
+    min_pixels: int = MIN_PIXELS
+    max_pixels: int = MAX_PIXELS
     timeout: float = REQUEST_TIMEOUT
     prompt: str = OCR_PROMPT
     enable_thinking: bool = ENABLE_THINKING

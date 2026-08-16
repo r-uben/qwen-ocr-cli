@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from qwen_ocr import config
+
 #: A hybrid-thinking model's reasoning block, when the server inlines it into the
 #: message content instead of a separate ``reasoning_content`` field.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -23,6 +25,40 @@ def strip_thinking(text: str) -> str:
     removed, so ordinary page text containing a stray angle bracket is untouched.
     """
     return _THINK_BLOCK.sub("", text).strip()
+
+
+def smart_resize(
+    width: int,
+    height: int,
+    min_pixels: int,
+    max_pixels: int,
+    factor: int = config.PATCH_FACTOR,
+) -> tuple[int, int]:
+    """Qwen's patch-aligned resize: the cookbook's rule, applied client-side.
+
+    Returns the ``(width, height)`` to send so that both sides are multiples of
+    ``factor`` and the area lands inside ``[min_pixels, max_pixels]``, preserving
+    aspect ratio. This is the reference implementation from QwenLM/Qwen3-VL
+    (``cookbooks/ocr.ipynb`` / ``qwen_vl_utils``), reproduced here so the pixel
+    budget is enforced on EVERY backend rather than left to a server-side default
+    we neither choose nor record (issue #5).
+    """
+    if min(width, height) <= 0:
+        raise ValueError(f"degenerate image size: {width}x{height}")
+
+    def _round(x: float) -> int:
+        return max(factor, round(x / factor) * factor)
+
+    w_bar, h_bar = _round(width), _round(height)
+    if w_bar * h_bar > max_pixels:
+        beta = ((width * height) / max_pixels) ** 0.5
+        w_bar = max(factor, int(width / beta) // factor * factor)
+        h_bar = max(factor, int(height / beta) // factor * factor)
+    elif w_bar * h_bar < min_pixels:
+        beta = (min_pixels / (width * height)) ** 0.5
+        w_bar = -(-int(width * beta) // factor) * factor
+        h_bar = -(-int(height * beta) // factor) * factor
+    return w_bar, h_bar
 
 
 def sanitize_filename(name: str) -> str:

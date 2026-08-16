@@ -2,6 +2,7 @@
 
     qwen-ocr process <path-or-dir> [-o <out>] [--backend auto|ollama|vllm|api]
                      [--prefer cost|quality|speed] [--model M] [--dpi N]
+                     [--min-pixels N] [--max-pixels N] [--thinking/--no-thinking]
                      [-w N] [-q] [--verbose] [--reprocess]
     qwen-ocr backends
     qwen-ocr --version
@@ -73,6 +74,21 @@ def main() -> None:
     help="Accepted for socr compatibility; currently a no-op (pages OCR sequentially).",
 )
 @click.option(
+    "--min-pixels",
+    type=int,
+    default=config.MIN_PIXELS,
+    show_default=True,
+    help="Lower bound of the input pixel budget (Qwen OCR cookbook: 512*32*32).",
+)
+@click.option(
+    "--max-pixels",
+    type=int,
+    default=config.MAX_PIXELS,
+    show_default=True,
+    help="Upper bound of the input pixel budget (cookbook: 2048*32*32 ~ 2.1 MP). "
+    "Raise deliberately for dense tables.",
+)
+@click.option(
     "--thinking/--no-thinking",
     "thinking",
     default=config.ENABLE_THINKING,
@@ -84,7 +100,19 @@ def main() -> None:
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress; emit output paths only.")
 @click.option("--verbose", is_flag=True, help="Verbose logging.")
 def process_cmd(
-    source, output, backend, prefer, model, dpi, workers, thinking, reprocess, quiet, verbose
+    source,
+    output,
+    backend,
+    prefer,
+    model,
+    dpi,
+    workers,
+    min_pixels,
+    max_pixels,
+    thinking,
+    reprocess,
+    quiet,
+    verbose,
 ):
     """Process a PDF (or a directory of page images / a tree of PDFs)."""
     logging.basicConfig(
@@ -106,7 +134,11 @@ def process_cmd(
         if not avail.ok:
             raise click.ClickException(f"backend '{backend}' unavailable: {avail.reason}")
 
-    params = InferenceParams(enable_thinking=thinking)
+    if min_pixels > max_pixels:
+        raise click.ClickException(
+            f"--min-pixels ({min_pixels}) exceeds --max-pixels ({max_pixels})"
+        )
+    params = InferenceParams(enable_thinking=thinking, min_pixels=min_pixels, max_pixels=max_pixels)
     try:
         outcome = process(
             Path(source),
@@ -125,7 +157,10 @@ def process_cmd(
         for path in outcome.outputs:
             click.echo(path)
     else:
-        click.echo(f"qwen-ocr: backend={engine.name} dpi={dpi}")
+        click.echo(
+            f"qwen-ocr: backend={engine.name} dpi={dpi} "
+            f"pixels={min_pixels}-{max_pixels} thinking={'on' if thinking else 'off'}"
+        )
         click.echo(f"  {outcome.completed}/{total} document(s) completed")
 
     # Failure diagnostics ALWAYS go to stderr, even under -q: socr reads stderr on

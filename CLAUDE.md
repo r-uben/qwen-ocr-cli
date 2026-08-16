@@ -13,6 +13,7 @@ implementation imports (see `../gemini-ocr-cli/gemini_ocr/processor.py`).
 
 ```
 qwen-ocr process <path-or-dir> [-o <out>] --backend <b> --dpi <N> [-w N] [-q] [--verbose] [--reprocess]
+                 [--min-pixels N] [--max-pixels N] [--thinking|--no-thinking]
 qwen-ocr --version          # exit 0 when installed  → socr availability probe
 qwen-ocr backends           # human-readable: which backends are live
 ```
@@ -46,10 +47,20 @@ One module per backend, all behind a common `Backend` protocol (`ocr_image(png) 
 - `select.py` — `resolve_backend(prefer)` does the smart auto-pick (see PLAN.md). Probing must
   never raise: a dead backend returns `unavailable`, never a crash.
 
+Two request-shaping rules apply to **all three** (defaults in `config.py`, never inlined):
+- **Thinking is off** (#4). Qwen3.5/3.6 are hybrid-thinking and answer an OCR prompt with
+  their reasoning wrapped around the transcription, which socr ingests as body text.
+  Spelling differs per backend — override `Backend._thinking_payload`, don't special-case in
+  `ocr_image`. `--thinking` is the escape hatch; `utils.strip_thinking` is the backstop.
+- **The input pixel budget is explicit** (#5). `utils.smart_resize` maps every page into
+  `[MIN_PIXELS, MAX_PIXELS]` (the Qwen cookbook's `512*32*32` / `2048*32*32`, patch-aligned to
+  32) client-side, so resolution is chosen and logged here rather than left to a server-side
+  processor default. Never send an unresized page.
+
 ## Build / test
 
 ```bash
-uv sync                         # install deps into the project venv
+uv sync --extra dev             # install deps into the project venv (pytest/ruff live in `dev`)
 uv run qwen-ocr --version       # smoke test
 uv run pytest -q                # unit tests (mock the backends; no live models in CI)
 uv run ruff check . && uv run ruff format .

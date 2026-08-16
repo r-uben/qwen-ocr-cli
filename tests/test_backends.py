@@ -8,11 +8,13 @@ import httpx
 import pytest
 from PIL import Image
 
+from qwen_ocr import config
 from qwen_ocr.backends.api import ApiBackend
 from qwen_ocr.backends.base import _encode_image, _extract_text
 from qwen_ocr.backends.ollama import OllamaBackend
 from qwen_ocr.backends.vllm import VLLMBackend
 from qwen_ocr.config import InferenceParams
+from qwen_ocr.utils import smart_resize
 
 # --- availability probes ---
 
@@ -84,17 +86,44 @@ def test_ollama_endpoint_sends_resolved_tag(monkeypatch):
 # --- image encoding + response parsing ---
 
 
-def test_encode_image_downscales(tmp_path):
+def _decoded_size(url):
     from io import BytesIO
 
-    img = tmp_path / "p.png"
-    Image.new("RGB", (8000, 100), "white").save(img)
-    url = _encode_image(img, max_side=4000)
-    assert url.startswith("data:image/png;base64,")
     raw = base64.b64decode(url.split(",", 1)[1])
-    # decoded image's longest side must be capped at max_side
     with Image.open(BytesIO(raw)) as got:
-        assert max(got.size) == 4000
+        return got.size
+
+
+def test_encode_image_downscales_into_budget(tmp_path):
+    # Issue #5: a 300-DPI A4 page (~8.7 MP) must arrive inside the cookbook budget.
+    img = tmp_path / "p.png"
+    Image.new("RGB", (2480, 3508), "white").save(img)
+    url = _encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS)
+    assert url.startswith("data:image/png;base64,")
+    w, h = _decoded_size(url)
+    assert w * h <= config.MAX_PIXELS
+    assert w % config.PATCH_FACTOR == 0 and h % config.PATCH_FACTOR == 0
+    assert abs((w / h) - (2480 / 3508)) < 0.02  # aspect ratio preserved
+
+
+def test_encode_image_upscales_tiny_page(tmp_path):
+    # Below min_pixels the processor would pad an under-resolved page; scale it up.
+    img = tmp_path / "p.png"
+    Image.new("RGB", (200, 300), "white").save(img)
+    w, h = _decoded_size(_encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS))
+    assert w * h >= config.MIN_PIXELS
+
+
+def test_smart_resize_leaves_in_budget_image_alone():
+    size = (1024, 1024)  # 1.05 MP, patch-aligned, inside [min, max]
+    assert smart_resize(*size, config.MIN_PIXELS, config.MAX_PIXELS) == size
+
+
+def test_smart_resize_honours_raised_ceiling():
+    # A deliberately raised ceiling must actually buy resolution (dense tables).
+    big = config.MAX_PIXELS * 4
+    w, h = smart_resize(2480, 3508, config.MIN_PIXELS, big)
+    assert config.MAX_PIXELS < w * h <= big
 
 
 def test_extract_text_happy():
