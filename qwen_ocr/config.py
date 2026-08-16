@@ -34,6 +34,13 @@ TEMPERATURE = 0.0
 # corroborating Dasanaike's post-processing approach). Raise only with evidence.
 REPETITION_PENALTY = 1.0
 REQUEST_TIMEOUT = 300.0
+# Hybrid-thinking models (Qwen3.5 / Qwen3.6) answer an OCR prompt with their *reasoning*
+# ("The user wants me to transcribe... **1. Analyze the Image:**") wrapped around the
+# transcription; downstream (socr) ingests that commentary as body text of the document.
+# Measured on Bocconi HPC (H100, vLLM 0.17, Qwen/Qwen3.5-35B-A3B-FP8): the same request
+# plus thinking-off returns clean output. OCR is transcription, not reasoning — off by
+# default, with `--thinking` as the escape hatch. See issue #4.
+ENABLE_THINKING = False
 
 OCR_PROMPT = (
     "Transcribe all text in this image into clean Markdown. "
@@ -53,3 +60,4 @@ class InferenceParams:
     max_image_side: int = MAX_IMAGE_SIDE
     timeout: float = REQUEST_TIMEOUT
     prompt: str = OCR_PROMPT
+    enable_thinking: bool = ENABLE_THINKING

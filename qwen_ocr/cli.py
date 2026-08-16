@@ -72,10 +72,20 @@ def main() -> None:
     default=1,
     help="Accepted for socr compatibility; currently a no-op (pages OCR sequentially).",
 )
+@click.option(
+    "--thinking/--no-thinking",
+    "thinking",
+    default=config.ENABLE_THINKING,
+    show_default=True,
+    help="Let hybrid-thinking models reason before answering. Off for OCR: their "
+    "reasoning leaks into the transcription as body text (issue #4).",
+)
 @click.option("--reprocess", is_flag=True, help="Re-OCR documents already recorded completed.")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress; emit output paths only.")
 @click.option("--verbose", is_flag=True, help="Verbose logging.")
-def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess, quiet, verbose):
+def process_cmd(
+    source, output, backend, prefer, model, dpi, workers, thinking, reprocess, quiet, verbose
+):
     """Process a PDF (or a directory of page images / a tree of PDFs)."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
@@ -96,7 +106,7 @@ def process_cmd(source, output, backend, prefer, model, dpi, workers, reprocess,
         if not avail.ok:
             raise click.ClickException(f"backend '{backend}' unavailable: {avail.reason}")
 
-    params = InferenceParams()
+    params = InferenceParams(enable_thinking=thinking)
     try:
         outcome = process(
             Path(source),

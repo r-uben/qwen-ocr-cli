@@ -46,7 +46,7 @@ from ocr_output_contract import (
 
 from qwen_ocr.backends.base import Backend
 from qwen_ocr.config import InferenceParams
-from qwen_ocr.utils import sanitize_filename, trim_degenerate_tail
+from qwen_ocr.utils import sanitize_filename, strip_thinking, trim_degenerate_tail
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ def _ocr_pages(
     for idx, image in enumerate(images, start=1):
         try:
             text = backend.ocr_image(image, params)
-            text = trim_degenerate_tail(text)
+            text = trim_degenerate_tail(strip_thinking(text))
             if not text.strip():
                 raise ValueError("empty OCR response (no text returned)")
             pages.append(text)
@@ -197,8 +197,8 @@ def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str
     qwen has no task selector, but its page text genuinely depends on more than
     model + backend: the render ``--dpi`` (resolution at which the PDF is
     rasterized) and the :class:`InferenceParams` (prompt, token budget,
-    temperature, repetition penalty, max image side) all change what OCR a given
-    input produces. v0.1.2's ``run_fingerprint(extra=...)`` folds these RESOLVED
+    temperature, repetition penalty, max image side, thinking mode) all change what
+    OCR a given input produces. v0.1.2's ``run_fingerprint(extra=...)`` folds these RESOLVED
     flags into the fingerprint, which :meth:`RootIndex.is_completed` consults, so
     re-running the same input at a different ``--dpi`` (or with changed inference
     params) reprocesses instead of silently reusing stale lower-res OCR.
@@ -210,6 +210,7 @@ def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str
         "repetition_penalty": params.repetition_penalty,
         "max_image_side": params.max_image_side,
         "prompt": params.prompt,
+        "enable_thinking": params.enable_thinking,
     }
     return run_fingerprint(_backend_model(backend), backend.name, extra=extra)
 

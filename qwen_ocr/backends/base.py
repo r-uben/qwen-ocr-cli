@@ -42,6 +42,20 @@ class Backend(abc.ABC):
     def _endpoint(self) -> tuple[str, str | None, str]:
         """Return (base_url, api_key_or_None, model)."""
 
+    def _thinking_payload(self, enable_thinking: bool) -> dict:
+        """Extra request keys that turn a hybrid-thinking model's reasoning off.
+
+        OpenAI-compatible servers spell this differently. vLLM (and OpenRouter's
+        Qwen routes) forward ``chat_template_kwargs`` into the chat template, where
+        ``enable_thinking=False`` selects the non-thinking branch — verified live on
+        Qwen/Qwen3.5-35B-A3B-FP8 under vLLM 0.17 (issue #4). Ollama overrides this
+        with its own ``think`` key. Returning ``{}`` when thinking is *enabled*
+        leaves the server default untouched.
+        """
+        if enable_thinking:
+            return {}
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+
     def ocr_image(self, image_path: Path, params: InferenceParams) -> str:
         """OCR a single page image to Markdown via OpenAI-compatible chat."""
         base_url, api_key, model = self._endpoint()
@@ -67,6 +81,7 @@ class Backend(abc.ABC):
             # OpenAI ignores unknown keys; vLLM/Ollama/DashScope honour these.
             "repetition_penalty": params.repetition_penalty,
         }
+        payload.update(self._thinking_payload(params.enable_thinking))
 
         url = base_url.rstrip("/") + "/chat/completions"
         resp = httpx.post(url, json=payload, headers=headers, timeout=params.timeout)

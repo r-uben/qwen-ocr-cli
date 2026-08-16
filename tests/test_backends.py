@@ -127,3 +127,64 @@ def test_ocr_image_posts_and_parses(monkeypatch, tmp_path):
     assert out == "ok text"
     assert captured["url"].endswith("/chat/completions")
     assert captured["model"] == "m"
+
+
+# --- thinking mode (issue #4) ---
+
+
+def _capture_payload(monkeypatch, backend, tmp_path, params):
+    """POST once through `backend` and return the request body."""
+    img = tmp_path / "p.png"
+    Image.new("RGB", (100, 100), "white").save(img)
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(json)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    backend.ocr_image(img, params)
+    return captured
+
+
+def test_thinking_off_by_default():
+    # OCR is transcription, not reasoning: the default must disable thinking.
+    assert InferenceParams().enable_thinking is False
+
+
+def test_vllm_sends_chat_template_kwargs(monkeypatch, tmp_path):
+    body = _capture_payload(
+        monkeypatch, VLLMBackend(base_url="http://x/v1", model="m"), tmp_path, InferenceParams()
+    )
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_thinking_flag_leaves_server_default_alone(monkeypatch, tmp_path):
+    body = _capture_payload(
+        monkeypatch,
+        VLLMBackend(base_url="http://x/v1", model="m"),
+        tmp_path,
+        InferenceParams(enable_thinking=True),
+    )
+    assert "chat_template_kwargs" not in body and "think" not in body
+
+
+def test_ollama_sends_think_false(monkeypatch, tmp_path):
+    # Ollama ignores chat_template_kwargs; it gates reasoning on `think`.
+    b = OllamaBackend(base_url="http://x/v1", model="m")
+    b._resolved_model = "m:8b"  # skip the probe
+    body = _capture_payload(monkeypatch, b, tmp_path, InferenceParams())
+    assert body["think"] is False
+    assert "chat_template_kwargs" not in body
+
+
+def test_dashscope_sends_both_switches(monkeypatch, tmp_path):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    body = _capture_payload(monkeypatch, ApiBackend(), tmp_path, InferenceParams())
+    assert body["enable_thinking"] is False
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}

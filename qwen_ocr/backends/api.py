@@ -43,6 +43,16 @@ class ApiBackend(Backend):
             )
         raise RuntimeError("no cloud API key set")  # guarded by availability()
 
+    def _thinking_payload(self, enable_thinking: bool) -> dict:
+        # DashScope's OpenAI-compatible mode gates reasoning on a top-level
+        # `enable_thinking` (what the SDK sends as extra_body); OpenRouter forwards
+        # chat_template_kwargs to the upstream server. Send both on DashScope so the
+        # switch lands whichever layer honours it (issue #4).
+        payload = super()._thinking_payload(enable_thinking)
+        if not enable_thinking and self.provider == "dashscope":
+            payload["enable_thinking"] = False
+        return payload
+
     def availability(self) -> Availability:
         if self.provider:
             return Availability(True)

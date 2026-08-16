@@ -7,6 +7,23 @@ before writing. Detection-only; socr's downstream audit still has the final say.
 
 from __future__ import annotations
 
+import re
+
+#: A hybrid-thinking model's reasoning block, when the server inlines it into the
+#: message content instead of a separate ``reasoning_content`` field.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove ``<think>...</think>`` blocks from a model response.
+
+    Belt-and-braces for issue #4: the real fix is asking the server not to think
+    (``InferenceParams.enable_thinking=False``), but a server that ignores the switch
+    must not silently write reasoning into the document body. Only *matched* pairs are
+    removed, so ordinary page text containing a stray angle bracket is untouched.
+    """
+    return _THINK_BLOCK.sub("", text).strip()
+
 
 def sanitize_filename(name: str) -> str:
     """Sanitize a stem for use as a *temp render PNG* name only.

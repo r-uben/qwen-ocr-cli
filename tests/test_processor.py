@@ -11,7 +11,7 @@ from PIL import Image
 from qwen_ocr.backends.base import Availability, Backend
 from qwen_ocr.config import InferenceParams
 from qwen_ocr.processor import process
-from qwen_ocr.utils import trim_degenerate_tail
+from qwen_ocr.utils import strip_thinking, trim_degenerate_tail
 
 
 class FakeBackend(Backend):
@@ -394,3 +394,27 @@ def test_trim_degenerate_tail():
     out = trim_degenerate_tail(loop)
     assert out.count("spam") == 1
     assert "real text" in out
+
+
+def test_strip_thinking_removes_reasoning_block():
+    # Issue #4: a server that ignores the switch must not write reasoning into the body.
+    assert strip_thinking("<think>I should transcribe...</think>\n# Title") == "# Title"
+    # Unmatched/absent tags leave real page text alone.
+    body = "The value of <think> in the model is discussed"
+    assert strip_thinking(body) == body
+
+
+def test_page_text_is_stripped_of_thinking(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+    process(
+        pdf,
+        FakeBackend("<think>let me look</think>real page text"),
+        InferenceParams(),
+        dpi=72,
+        output_dir=out,
+    )
+    body = (out / "doc" / "doc.md").read_text()
+    assert "let me look" not in body
+    assert "real page text" in body

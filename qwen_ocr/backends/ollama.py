@@ -25,6 +25,11 @@ class OllamaBackend(Backend):
         # Ollama's OpenAI-compatible endpoint ignores the key but one is required.
         return self.base_url, "ollama", model
 
+    def _thinking_payload(self, enable_thinking: bool) -> dict:
+        # Ollama does not read chat_template_kwargs; it gates reasoning on its own
+        # top-level `think` key (issue #4).
+        return {} if enable_thinking else {"think": False}
+
     def availability(self) -> Availability:
         # Ollama exposes /api/tags at the host root (not under /v1).
         root = self.base_url.rstrip("/")
