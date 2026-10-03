@@ -409,3 +409,12 @@ def test_exact_secret_does_not_leave_token_remainder():
     key = "sk-AAA"
     out = redact_credentials(f"api_key={key}BBBCCC and bare {key}", (key,))
     assert "BBBCCC" not in out and key not in out
+
+
+def test_redaction_escaped_quote_in_quoted_value():
+    from qwen_ocr.backends.base import redact_credentials
+
+    dq = r'{"password":"prefix\"suffix"}'
+    sq = r"{'token':'prefix\'suffix'}"
+    assert "suffix" not in redact_credentials(dq)
+    assert "suffix" not in redact_credentials(sq)

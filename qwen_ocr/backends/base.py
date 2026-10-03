@@ -39,7 +39,7 @@ _BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
 # so spaces inside it do not leave a suffix behind.
 _KV_RE = re.compile(
     r"(?i)(?P<k>\b(?:password|passwd|pwd|secret|token|api[_-]?key|apikey)\b"
-    r"[\"']?\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s\"',&;}]+)"
+    r"[\"']?\s*[=:]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"',&;}]+)"
 )
 REDACTED = "***"
 
