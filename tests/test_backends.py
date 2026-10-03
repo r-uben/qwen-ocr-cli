@@ -378,3 +378,34 @@ def test_logs_leak_no_credentials(monkeypatch, tmp_path, caplog):
         _backend("http://user:pw@x/v1").ocr_image(_page(tmp_path), InferenceParams())
     assert "pw" not in caplog.text and "user:" not in caplog.text
     assert "pw" not in str(ei.value)
+
+
+def test_302_raises_and_is_not_parsed(monkeypatch, tmp_path):
+    seen = _mock_post(
+        monkeypatch,
+        lambda r: httpx.Response(302, json={"choices": [{"message": {"content": "NOT OCR"}}]}),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        _backend().ocr_image(_page(tmp_path), InferenceParams())
+    assert len(seen) == 1
+
+
+def test_redaction_quoted_value_with_spaces_and_header_lines():
+    from qwen_ocr.backends.base import redact_credentials
+
+    s = (
+        "password=\"my secret pass\" token='a b c'\n"
+        "Authorization: Basic dXNlcjpwdw==\nAuthorization: Bearer abc.def ghi\n"
+        "proxy-authorization: Digest realm=x"
+    )
+    out = redact_credentials(s)
+    for leaked in ("secret pass", "b c", "dXNlcjpwdw", "ghi", "Digest", "abc.def"):
+        assert leaked not in out
+
+
+def test_exact_secret_does_not_leave_token_remainder():
+    from qwen_ocr.backends.base import redact_credentials
+
+    key = "sk-AAA"
+    out = redact_credentials(f"api_key={key}BBBCCC and bare {key}", (key,))
+    assert "BBBCCC" not in out and key not in out

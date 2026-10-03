@@ -32,11 +32,14 @@ SERVER_ERROR_RETRY_DELAY_S = 2.0
 ERROR_BODY_CHARS = 300
 
 _USERINFO_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
-# Bearer tokens, and key=value / "key": "value" pairs for credential-looking keys (any length).
-_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+# Whole Authorization header lines: consume the scheme and credential to end of line.
+_AUTH_LINE_RE = re.compile(r"(?i)(?P<k>\b(?:proxy-)?authorization\b[\"']?\s*[=:]\s*)[^\r\n]*")
+_BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
+# key=value / "key": "value" for credential-looking keys; a quoted value is matched whole,
+# so spaces inside it do not leave a suffix behind.
 _KV_RE = re.compile(
-    r"(?i)(?P<k>\b(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|authorization)\b"
-    r"[\"']?\s*[=:]\s*[\"']?)[^\s\"',&;}]+"
+    r"(?i)(?P<k>\b(?:password|passwd|pwd|secret|token|api[_-]?key|apikey)\b"
+    r"[\"']?\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s\"',&;}]+)"
 )
 REDACTED = "***"
 
@@ -44,14 +47,17 @@ REDACTED = "***"
 def redact_credentials(text: str, secrets: tuple[str, ...] = ()) -> str:
     """Strip credentials from text bound for an error message or log.
 
-    ``secrets`` are exact values the caller knows (API key, URL password); they are
-    replaced wherever they appear, which catches bare echoed keys no pattern could.
+    Pattern passes run first, then ``secrets`` (exact values the caller knows: API key,
+    URL password) are replaced wherever they still appear, catching bare echoed keys no
+    pattern could. Exact replacement goes last so ``***`` never splits a token mid-match.
     """
+    text = _USERINFO_RE.sub(r"\g<scheme>" + REDACTED + "@", text)
+    text = _AUTH_LINE_RE.sub(lambda m: m.group("k") + REDACTED, text)
+    text = _BEARER_RE.sub(lambda m: m.group(0).split()[0] + " " + REDACTED, text)
+    text = _KV_RE.sub(lambda m: m.group("k") + REDACTED, text)
     for secret in sorted((x for x in secrets if x), key=len, reverse=True):
         text = text.replace(secret, REDACTED)
-    text = _USERINFO_RE.sub(r"\g<scheme>" + REDACTED + "@", text)
-    text = _BEARER_RE.sub("Bearer " + REDACTED, text)
-    return _KV_RE.sub(lambda m: m.group("k") + REDACTED, text)
+    return text
 
 
 class BackendServerError(httpx.HTTPStatusError):
@@ -161,8 +167,8 @@ def _post_with_5xx_retry(
     One monotonic deadline spans both attempts: each attempt gets the budget left at that
     moment, and the retry is skipped when the delay plus a nonzero budget no longer fits.
     (httpx applies a timeout per operation, so a single attempt is bounded by the remaining
-    budget per read/connect, not as a hard wall-clock cap.) Timeouts and 4xx never retry.
-    Any 4xx/5xx raises with the redacted response body.
+    budget per read/connect, not as a hard wall-clock cap.) Timeouts, 3xx and 4xx never
+    retry. Any non-2xx raises with the redacted response body.
     """
     deadline = time.monotonic() + timeout
     resp = httpx.post(url, json=payload, headers=headers, timeout=timeout, **extra)
@@ -173,7 +179,7 @@ def _post_with_5xx_retry(
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 resp = httpx.post(url, json=payload, headers=headers, timeout=remaining, **extra)
-    if resp.status_code >= 400:
+    if not resp.is_success:  # like raise_for_status: 3xx/4xx/5xx all raise
         # Redact the whole body first, then truncate, so a token cut at the boundary can't leak.
         body = redact_credentials(resp.text, secrets)[:ERROR_BODY_CHARS]
         raise BackendServerError(
