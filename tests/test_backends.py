@@ -217,3 +217,73 @@ def test_dashscope_sends_both_switches(monkeypatch, tmp_path):
     body = _capture_payload(monkeypatch, ApiBackend(), tmp_path, InferenceParams())
     assert body["enable_thinking"] is False
     assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+# --- 5xx body + single retry (socr#1020) ---
+
+
+def _mock_post(monkeypatch, handler):
+    """Route httpx.post through a MockTransport; return the list of seen requests."""
+    seen = []
+
+    def wrapped(request):
+        seen.append(request)
+        return handler(request)
+
+    def fake_post(url, json, headers, timeout):
+        with httpx.Client(transport=httpx.MockTransport(wrapped)) as c:
+            return c.post(url, json=json, headers=headers, timeout=timeout)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr("qwen_ocr.backends.base.SERVER_ERROR_RETRY_DELAY_S", 0.0)
+    return seen
+
+
+def _page(tmp_path):
+    img = tmp_path / "p.png"
+    Image.new("RGB", (100, 100), "white").save(img)
+    return img
+
+
+def test_500_then_200_retries_once(monkeypatch, tmp_path):
+    replies = iter(
+        [
+            httpx.Response(500, text="boom"),
+            httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]}),
+        ]
+    )
+    seen = _mock_post(monkeypatch, lambda r: next(replies))
+    out = VLLMBackend(base_url="http://x/v1", model="m").ocr_image(
+        _page(tmp_path), InferenceParams()
+    )
+    assert out == "ok"
+    assert len(seen) == 2
+    assert seen[0].content == seen[1].content  # same request, same model
+
+
+def test_500_then_500_raises_with_body(monkeypatch, tmp_path):
+    seen = _mock_post(monkeypatch, lambda r: httpx.Response(500, text="model runner crashed " * 40))
+    backend = VLLMBackend(base_url="http://user:pw@x/v1", model="m")
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        backend.ocr_image(_page(tmp_path), InferenceParams())
+    msg = str(ei.value)
+    assert "model runner crashed" in msg
+    assert "pw" not in msg
+    assert len(seen) == 2
+
+
+def test_404_does_not_retry(monkeypatch, tmp_path):
+    seen = _mock_post(monkeypatch, lambda r: httpx.Response(404, text="nope"))
+    with pytest.raises(httpx.HTTPStatusError):
+        VLLMBackend(base_url="http://x/v1", model="m").ocr_image(_page(tmp_path), InferenceParams())
+    assert len(seen) == 1
+
+
+def test_timeout_does_not_retry(monkeypatch, tmp_path):
+    def boom(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    seen = _mock_post(monkeypatch, boom)
+    with pytest.raises(httpx.ReadTimeout):
+        VLLMBackend(base_url="http://x/v1", model="m").ocr_image(_page(tmp_path), InferenceParams())
+    assert len(seen) == 1

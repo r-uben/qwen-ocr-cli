@@ -13,6 +13,8 @@ from __future__ import annotations
 import abc
 import base64
 import logging
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +24,24 @@ from qwen_ocr.config import InferenceParams
 from qwen_ocr.utils import smart_resize
 
 logger = logging.getLogger(__name__)
+
+# One retry on a 5xx, after this pause. Ollama 500s are often transient (model load, GPU hiccup).
+SERVER_ERROR_RETRY_DELAY_S = 2.0
+# Characters of the 5xx response body kept in the error message.
+ERROR_BODY_CHARS = 300
+
+_USERINFO_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
+_BEARER_RE = re.compile(r"(?i)\b(bearer|api[_-]?key|token)([\"'=:\s]+)[A-Za-z0-9._~+/=-]{8,}")
+
+
+def redact_credentials(text: str) -> str:
+    """Strip URL userinfo and bearer-style tokens from text bound for an error message."""
+    text = _USERINFO_RE.sub(r"\g<scheme>***@", text)
+    return _BEARER_RE.sub(r"\1\2***", text)
+
+
+class BackendServerError(httpx.HTTPStatusError):
+    """5xx from the backend; the message carries the (redacted) response body."""
 
 
 @dataclass(frozen=True)
@@ -88,10 +108,34 @@ class Backend(abc.ABC):
         payload.update(self._thinking_payload(params.enable_thinking))
 
         url = base_url.rstrip("/") + "/chat/completions"
-        resp = httpx.post(url, json=payload, headers=headers, timeout=params.timeout)
-        resp.raise_for_status()
+        resp = _post_with_5xx_retry(url, payload, headers, params.timeout)
         data = resp.json()
         return _extract_text(data)
+
+
+def _post_with_5xx_retry(url: str, payload: dict, headers: dict, timeout: float) -> httpx.Response:
+    """POST; on a 5xx retry once (same request) after a short delay.
+
+    Total time stays within ``timeout``: the retry gets only the budget left after the first
+    attempt and the delay. Timeouts and 4xx are not retried. A final 5xx raises with the body.
+    """
+    start = time.monotonic()
+    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    if resp.status_code >= 500:
+        remaining = timeout - (time.monotonic() - start) - SERVER_ERROR_RETRY_DELAY_S
+        if remaining > 0:
+            logger.warning("HTTP %d from backend; retrying once", resp.status_code)
+            time.sleep(SERVER_ERROR_RETRY_DELAY_S)
+            resp = httpx.post(url, json=payload, headers=headers, timeout=remaining)
+    if resp.status_code >= 500:
+        body = redact_credentials(resp.text[:ERROR_BODY_CHARS])
+        raise BackendServerError(
+            f"HTTP {resp.status_code} from {redact_credentials(url)}: {body}",
+            request=resp.request,
+            response=resp,
+        )
+    resp.raise_for_status()
+    return resp
 
 
 def _encode_image(image_path: Path, min_pixels: int, max_pixels: int) -> str:
