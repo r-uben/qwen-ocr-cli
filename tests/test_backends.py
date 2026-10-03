@@ -222,6 +222,17 @@ def test_dashscope_sends_both_switches(monkeypatch, tmp_path):
 # --- 5xx body + single retry (socr#1020) ---
 
 
+class _RetryingBackend(VLLMBackend):
+    """Stand-in for a free local backend (the policy flag Ollama sets)."""
+
+    retry_on_5xx = True
+
+
+def _backend(url="http://x/v1", retry=True):
+    cls = _RetryingBackend if retry else VLLMBackend
+    return cls(base_url=url, model="m")
+
+
 def _mock_post(monkeypatch, handler):
     """Route httpx.post through a MockTransport; return the list of seen requests."""
     seen = []
@@ -230,9 +241,9 @@ def _mock_post(monkeypatch, handler):
         seen.append(request)
         return handler(request)
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, **kw):
         with httpx.Client(transport=httpx.MockTransport(wrapped)) as c:
-            return c.post(url, json=json, headers=headers, timeout=timeout)
+            return c.post(url, json=json, headers=headers, timeout=timeout, **kw)
 
     monkeypatch.setattr(httpx, "post", fake_post)
     monkeypatch.setattr("qwen_ocr.backends.base.SERVER_ERROR_RETRY_DELAY_S", 0.0)
@@ -253,9 +264,7 @@ def test_500_then_200_retries_once(monkeypatch, tmp_path):
         ]
     )
     seen = _mock_post(monkeypatch, lambda r: next(replies))
-    out = VLLMBackend(base_url="http://x/v1", model="m").ocr_image(
-        _page(tmp_path), InferenceParams()
-    )
+    out = _backend().ocr_image(_page(tmp_path), InferenceParams())
     assert out == "ok"
     assert len(seen) == 2
     assert seen[0].content == seen[1].content  # same request, same model
@@ -263,20 +272,27 @@ def test_500_then_200_retries_once(monkeypatch, tmp_path):
 
 def test_500_then_500_raises_with_body(monkeypatch, tmp_path):
     seen = _mock_post(monkeypatch, lambda r: httpx.Response(500, text="model runner crashed " * 40))
-    backend = VLLMBackend(base_url="http://user:pw@x/v1", model="m")
     with pytest.raises(httpx.HTTPStatusError) as ei:
-        backend.ocr_image(_page(tmp_path), InferenceParams())
-    msg = str(ei.value)
-    assert "model runner crashed" in msg
-    assert "pw" not in msg
+        _backend("http://user:pw@x/v1").ocr_image(_page(tmp_path), InferenceParams())
+    assert "model runner crashed" in str(ei.value)
+    assert "pw" not in str(ei.value)
     assert len(seen) == 2
 
 
-def test_404_does_not_retry(monkeypatch, tmp_path):
-    seen = _mock_post(monkeypatch, lambda r: httpx.Response(404, text="nope"))
-    with pytest.raises(httpx.HTTPStatusError):
-        VLLMBackend(base_url="http://x/v1", model="m").ocr_image(_page(tmp_path), InferenceParams())
+def test_userinfo_sent_as_auth_not_in_url(monkeypatch, tmp_path):
+    ok = httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    seen = _mock_post(monkeypatch, lambda r: ok)
+    _backend("http://user:pw@x/v1").ocr_image(_page(tmp_path), InferenceParams())
+    assert "user" not in str(seen[0].url) and "pw" not in str(seen[0].url)
+    assert seen[0].headers["authorization"].startswith("Basic ")
+
+
+def test_404_does_not_retry_and_is_redacted(monkeypatch, tmp_path):
+    seen = _mock_post(monkeypatch, lambda r: httpx.Response(404, text="bad password=hunter2"))
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _backend().ocr_image(_page(tmp_path), InferenceParams())
     assert len(seen) == 1
+    assert "hunter2" not in str(ei.value)
 
 
 def test_timeout_does_not_retry(monkeypatch, tmp_path):
@@ -285,5 +301,80 @@ def test_timeout_does_not_retry(monkeypatch, tmp_path):
 
     seen = _mock_post(monkeypatch, boom)
     with pytest.raises(httpx.ReadTimeout):
-        VLLMBackend(base_url="http://x/v1", model="m").ocr_image(_page(tmp_path), InferenceParams())
+        _backend().ocr_image(_page(tmp_path), InferenceParams())
     assert len(seen) == 1
+
+
+def test_cloud_backend_does_not_retry(monkeypatch, tmp_path):
+    seen = _mock_post(monkeypatch, lambda r: httpx.Response(500, text="boom"))
+    with pytest.raises(httpx.HTTPStatusError):
+        _backend(retry=False).ocr_image(_page(tmp_path), InferenceParams())
+    assert len(seen) == 1
+    assert ApiBackend.retry_on_5xx is False and OllamaBackend.retry_on_5xx is True
+
+
+def test_retry_skipped_when_deadline_exhausted(monkeypatch, tmp_path):
+    clock = {"t": 0.0}
+    monkeypatch.setattr("qwen_ocr.backends.base.time.monotonic", lambda: clock["t"])
+
+    def slow_500(request):
+        clock["t"] += 100.0  # the first attempt eats the whole budget
+        return httpx.Response(500, text="boom")
+
+    seen = _mock_post(monkeypatch, slow_500)
+    with pytest.raises(httpx.HTTPStatusError):
+        _backend().ocr_image(_page(tmp_path), InferenceParams(timeout=100.0))
+    assert len(seen) == 1
+
+
+def test_retry_gets_remaining_budget_after_sleep(monkeypatch, tmp_path):
+    clock = {"t": 0.0}
+    monkeypatch.setattr("qwen_ocr.backends.base.time.monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        "qwen_ocr.backends.base.time.sleep", lambda s: clock.update(t=clock["t"] + s)
+    )
+    timeouts = []
+    replies = iter([500, 200])
+
+    def fake_post(url, json, headers, timeout, **kw):
+        timeouts.append(timeout)
+        clock["t"] += 10.0
+        code = next(replies)
+        body = {"choices": [{"message": {"content": "ok"}}]} if code == 200 else None
+        return httpx.Response(
+            code, json=body, text="x" if body is None else None, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr("qwen_ocr.backends.base.SERVER_ERROR_RETRY_DELAY_S", 5.0)
+    _backend().ocr_image(_page(tmp_path), InferenceParams(timeout=100.0))
+    assert timeouts == [100.0, 100.0 - 10.0 - 5.0]
+
+
+def test_redaction_precedes_truncation():
+    from qwen_ocr.backends.base import ERROR_BODY_CHARS, redact_credentials
+
+    key = "sk-SECRETSECRETSECRET"
+    body = "x" * (ERROR_BODY_CHARS - 5) + key  # key straddles the cut
+    out = redact_credentials(body, (key,))[:ERROR_BODY_CHARS]
+    assert "SECRET" not in out and "sk-" not in out
+
+
+def test_redaction_patterns():
+    from qwen_ocr.backends.base import redact_credentials
+
+    s = 'password=ab token: "x1" Authorization: Bearer abc.def http://u:p@h/ echo sk-bare'
+    out = redact_credentials(s, ("sk-bare",))
+    for leaked in ("ab ", "x1", "abc.def", "u:p", "sk-bare"):
+        assert leaked not in out
+
+
+def test_logs_leak_no_credentials(monkeypatch, tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    _mock_post(monkeypatch, lambda r: httpx.Response(500, text="boom"))
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        _backend("http://user:pw@x/v1").ocr_image(_page(tmp_path), InferenceParams())
+    assert "pw" not in caplog.text and "user:" not in caplog.text
+    assert "pw" not in str(ei.value)

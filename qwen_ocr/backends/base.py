@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 import httpx
 
@@ -31,17 +32,30 @@ SERVER_ERROR_RETRY_DELAY_S = 2.0
 ERROR_BODY_CHARS = 300
 
 _USERINFO_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
-_BEARER_RE = re.compile(r"(?i)\b(bearer|api[_-]?key|token)([\"'=:\s]+)[A-Za-z0-9._~+/=-]{8,}")
+# Bearer tokens, and key=value / "key": "value" pairs for credential-looking keys (any length).
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_KV_RE = re.compile(
+    r"(?i)(?P<k>\b(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|authorization)\b"
+    r"[\"']?\s*[=:]\s*[\"']?)[^\s\"',&;}]+"
+)
+REDACTED = "***"
 
 
-def redact_credentials(text: str) -> str:
-    """Strip URL userinfo and bearer-style tokens from text bound for an error message."""
-    text = _USERINFO_RE.sub(r"\g<scheme>***@", text)
-    return _BEARER_RE.sub(r"\1\2***", text)
+def redact_credentials(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """Strip credentials from text bound for an error message or log.
+
+    ``secrets`` are exact values the caller knows (API key, URL password); they are
+    replaced wherever they appear, which catches bare echoed keys no pattern could.
+    """
+    for secret in sorted((x for x in secrets if x), key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
+    text = _USERINFO_RE.sub(r"\g<scheme>" + REDACTED + "@", text)
+    text = _BEARER_RE.sub("Bearer " + REDACTED, text)
+    return _KV_RE.sub(lambda m: m.group("k") + REDACTED, text)
 
 
 class BackendServerError(httpx.HTTPStatusError):
-    """5xx from the backend; the message carries the (redacted) response body."""
+    """HTTP error from the backend; the message carries the redacted response body."""
 
 
 @dataclass(frozen=True)
@@ -54,6 +68,9 @@ class Backend(abc.ABC):
     """One OCR backend. Subclasses set name/base_url/model/auth + a probe."""
 
     name: str
+    # Retry policy, explicit per backend: only free local backends may re-send a request after
+    # a 5xx. A billed cloud backend may have charged for the failed call, so it never retries.
+    retry_on_5xx: bool = False
 
     @abc.abstractmethod
     def availability(self) -> Availability:
@@ -107,34 +124,63 @@ class Backend(abc.ABC):
         }
         payload.update(self._thinking_payload(params.enable_thinking))
 
-        url = base_url.rstrip("/") + "/chat/completions"
-        resp = _post_with_5xx_retry(url, payload, headers, params.timeout)
+        # httpx logs the request URL; keep userinfo out of it and send it as Basic auth.
+        parsed = httpx.URL(base_url.rstrip("/") + "/chat/completions")
+        extra: dict = {}
+        secrets = [api_key or ""]
+        if parsed.userinfo:
+            user, _, password = parsed.userinfo.decode().partition(":")
+            extra["auth"] = httpx.BasicAuth(unquote(user), unquote(password))
+            secrets += [parsed.userinfo.decode(), password, unquote(password)]
+            parsed = parsed.copy_with(userinfo=None)
+        resp = _post_with_5xx_retry(
+            str(parsed),
+            payload,
+            headers,
+            params.timeout,
+            retry=self.retry_on_5xx,
+            secrets=tuple(secrets),
+            **extra,
+        )
         data = resp.json()
         return _extract_text(data)
 
 
-def _post_with_5xx_retry(url: str, payload: dict, headers: dict, timeout: float) -> httpx.Response:
-    """POST; on a 5xx retry once (same request) after a short delay.
+def _post_with_5xx_retry(
+    url: str,
+    payload: dict,
+    headers: dict,
+    timeout: float,
+    *,
+    retry: bool,
+    secrets: tuple[str, ...] = (),
+    **extra,
+) -> httpx.Response:
+    """POST; if ``retry``, retry a 5xx once (same request) after a short delay.
 
-    Total time stays within ``timeout``: the retry gets only the budget left after the first
-    attempt and the delay. Timeouts and 4xx are not retried. A final 5xx raises with the body.
+    One monotonic deadline spans both attempts: each attempt gets the budget left at that
+    moment, and the retry is skipped when the delay plus a nonzero budget no longer fits.
+    (httpx applies a timeout per operation, so a single attempt is bounded by the remaining
+    budget per read/connect, not as a hard wall-clock cap.) Timeouts and 4xx never retry.
+    Any 4xx/5xx raises with the redacted response body.
     """
-    start = time.monotonic()
-    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
-    if resp.status_code >= 500:
-        remaining = timeout - (time.monotonic() - start) - SERVER_ERROR_RETRY_DELAY_S
-        if remaining > 0:
+    deadline = time.monotonic() + timeout
+    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout, **extra)
+    if retry and resp.status_code >= 500:
+        if deadline - time.monotonic() > SERVER_ERROR_RETRY_DELAY_S:
             logger.warning("HTTP %d from backend; retrying once", resp.status_code)
             time.sleep(SERVER_ERROR_RETRY_DELAY_S)
-            resp = httpx.post(url, json=payload, headers=headers, timeout=remaining)
-    if resp.status_code >= 500:
-        body = redact_credentials(resp.text[:ERROR_BODY_CHARS])
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                resp = httpx.post(url, json=payload, headers=headers, timeout=remaining, **extra)
+    if resp.status_code >= 400:
+        # Redact the whole body first, then truncate, so a token cut at the boundary can't leak.
+        body = redact_credentials(resp.text, secrets)[:ERROR_BODY_CHARS]
         raise BackendServerError(
-            f"HTTP {resp.status_code} from {redact_credentials(url)}: {body}",
+            f"HTTP {resp.status_code} from {redact_credentials(url, secrets)}: {body}",
             request=resp.request,
             response=resp,
         )
-    resp.raise_for_status()
     return resp
 
 
