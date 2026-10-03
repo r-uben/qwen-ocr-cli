@@ -10,6 +10,7 @@ from qwen_ocr.backends.base import Availability, Backend
 
 class OllamaBackend(Backend):
     name = "ollama"
+    retry_on_5xx = True  # local and free: a re-sent request bills nothing
 
     def __init__(self, base_url: str | None = None, model: str | None = None) -> None:
         self.base_url = base_url or config.OLLAMA_URL

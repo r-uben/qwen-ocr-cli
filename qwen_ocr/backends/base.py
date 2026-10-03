@@ -13,8 +13,11 @@ from __future__ import annotations
 import abc
 import base64
 import logging
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 import httpx
 
@@ -22,6 +25,43 @@ from qwen_ocr.config import InferenceParams
 from qwen_ocr.utils import smart_resize
 
 logger = logging.getLogger(__name__)
+
+# One retry on a 5xx, after this pause. Ollama 500s are often transient (model load, GPU hiccup).
+SERVER_ERROR_RETRY_DELAY_S = 2.0
+# Characters of the 5xx response body kept in the error message.
+ERROR_BODY_CHARS = 300
+
+_USERINFO_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
+# Whole Authorization header lines: consume the scheme and credential to end of line.
+_AUTH_LINE_RE = re.compile(r"(?i)(?P<k>\b(?:proxy-)?authorization\b[\"']?\s*[=:]\s*)[^\r\n]*")
+_BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
+# key=value / "key": "value" for credential-looking keys; a quoted value is matched whole,
+# so spaces inside it do not leave a suffix behind.
+_KV_RE = re.compile(
+    r"(?i)(?P<k>\b(?:password|passwd|pwd|secret|token|api[_-]?key|apikey)\b"
+    r"[\"']?\s*[=:]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"',&;}]+)"
+)
+REDACTED = "***"
+
+
+def redact_credentials(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """Strip credentials from text bound for an error message or log.
+
+    Pattern passes run first, then ``secrets`` (exact values the caller knows: API key,
+    URL password) are replaced wherever they still appear, catching bare echoed keys no
+    pattern could. Exact replacement goes last so ``***`` never splits a token mid-match.
+    """
+    text = _USERINFO_RE.sub(r"\g<scheme>" + REDACTED + "@", text)
+    text = _AUTH_LINE_RE.sub(lambda m: m.group("k") + REDACTED, text)
+    text = _BEARER_RE.sub(lambda m: m.group(0).split()[0] + " " + REDACTED, text)
+    text = _KV_RE.sub(lambda m: m.group("k") + REDACTED, text)
+    for secret in sorted((x for x in secrets if x), key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
+    return text
+
+
+class BackendServerError(httpx.HTTPStatusError):
+    """HTTP error from the backend; the message carries the redacted response body."""
 
 
 @dataclass(frozen=True)
@@ -34,6 +74,9 @@ class Backend(abc.ABC):
     """One OCR backend. Subclasses set name/base_url/model/auth + a probe."""
 
     name: str
+    # Retry policy, explicit per backend: only free local backends may re-send a request after
+    # a 5xx. A billed cloud backend may have charged for the failed call, so it never retries.
+    retry_on_5xx: bool = False
 
     @abc.abstractmethod
     def availability(self) -> Availability:
@@ -87,11 +130,64 @@ class Backend(abc.ABC):
         }
         payload.update(self._thinking_payload(params.enable_thinking))
 
-        url = base_url.rstrip("/") + "/chat/completions"
-        resp = httpx.post(url, json=payload, headers=headers, timeout=params.timeout)
-        resp.raise_for_status()
+        # httpx logs the request URL; keep userinfo out of it and send it as Basic auth.
+        parsed = httpx.URL(base_url.rstrip("/") + "/chat/completions")
+        extra: dict = {}
+        secrets = [api_key or ""]
+        if parsed.userinfo:
+            user, _, password = parsed.userinfo.decode().partition(":")
+            extra["auth"] = httpx.BasicAuth(unquote(user), unquote(password))
+            secrets += [parsed.userinfo.decode(), password, unquote(password)]
+            parsed = parsed.copy_with(userinfo=None)
+        resp = _post_with_5xx_retry(
+            str(parsed),
+            payload,
+            headers,
+            params.timeout,
+            retry=self.retry_on_5xx,
+            secrets=tuple(secrets),
+            **extra,
+        )
         data = resp.json()
         return _extract_text(data)
+
+
+def _post_with_5xx_retry(
+    url: str,
+    payload: dict,
+    headers: dict,
+    timeout: float,
+    *,
+    retry: bool,
+    secrets: tuple[str, ...] = (),
+    **extra,
+) -> httpx.Response:
+    """POST; if ``retry``, retry a 5xx once (same request) after a short delay.
+
+    One monotonic deadline spans both attempts: each attempt gets the budget left at that
+    moment, and the retry is skipped when the delay plus a nonzero budget no longer fits.
+    (httpx applies a timeout per operation, so a single attempt is bounded by the remaining
+    budget per read/connect, not as a hard wall-clock cap.) Timeouts, 3xx and 4xx never
+    retry. Any non-2xx raises with the redacted response body.
+    """
+    deadline = time.monotonic() + timeout
+    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout, **extra)
+    if retry and resp.status_code >= 500:
+        if deadline - time.monotonic() > SERVER_ERROR_RETRY_DELAY_S:
+            logger.warning("HTTP %d from backend; retrying once", resp.status_code)
+            time.sleep(SERVER_ERROR_RETRY_DELAY_S)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                resp = httpx.post(url, json=payload, headers=headers, timeout=remaining, **extra)
+    if not resp.is_success:  # like raise_for_status: 3xx/4xx/5xx all raise
+        # Redact the whole body first, then truncate, so a token cut at the boundary can't leak.
+        body = redact_credentials(resp.text, secrets)[:ERROR_BODY_CHARS]
+        raise BackendServerError(
+            f"HTTP {resp.status_code} from {redact_credentials(url, secrets)}: {body}",
+            request=resp.request,
+            response=resp,
+        )
+    return resp
 
 
 def _encode_image(image_path: Path, min_pixels: int, max_pixels: int) -> str:
