@@ -47,7 +47,7 @@ DEFAULT_DPI = 300  # higher than socr's 200 — validated lever for local OCR qu
 PATCH_FACTOR = 32
 MIN_PIXELS = int(os.environ.get("QWEN_OCR_MIN_PIXELS", 512 * PATCH_FACTOR * PATCH_FACTOR))
 MAX_PIXELS = int(os.environ.get("QWEN_OCR_MAX_PIXELS", 2048 * PATCH_FACTOR * PATCH_FACTOR))
-MAX_OUTPUT_TOKENS = 8192
+MAX_OUTPUT_TOKENS = int(os.environ.get("QWEN_OCR_MAX_OUTPUT_TOKENS", "8192"))
 TEMPERATURE = 0.0
 # Neutral (1.0) by design: a repetition penalty CORRUPTS OCR of tables/forms, whose
 # cells, separators, zeros and aligned spacing are legitimately repetitive. Degenerate

@@ -72,6 +72,34 @@ def test_process_writes_canonical_output(monkeypatch, tmp_path):
     assert "## Page 1" in body and "## Page 2" in body
 
 
+def test_max_output_tokens_flag_threads_through(monkeypatch, tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf)
+    seen = {}
+
+    class Recording(FakeBackend):
+        def ocr_image(self, image_path, params):
+            seen["max_output_tokens"] = params.max_output_tokens
+            return fake_ocr_result(self.text, model="fake-model")
+
+    monkeypatch.setattr(cli, "make_backend", lambda name, model=None: Recording())
+    res = CliRunner().invoke(
+        cli.main,
+        [
+            "process",
+            str(pdf),
+            "-o",
+            str(tmp_path / "out"),
+            "--backend",
+            "ollama",
+            "--max-output-tokens",
+            "16384",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert seen["max_output_tokens"] == 16384
+
+
 def test_pixel_budget_is_reported_and_flags_thread_through(monkeypatch, tmp_path):
     # Issue #5: the resolved budget must be visible, not implicit in a server default.
     pdf = tmp_path / "doc.pdf"

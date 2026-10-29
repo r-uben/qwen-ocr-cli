@@ -295,6 +295,43 @@ def test_message_order_image_first(monkeypatch, tmp_path):
     assert parts[0]["type"] == "image_url" and parts[1]["type"] == "text"
 
 
+def test_max_output_tokens_in_request_payload(monkeypatch, tmp_path):
+    img = tmp_path / "p.png"
+    Image.new("RGB", (100, 100), "white").save(img)
+    captured = {}
+
+    def fake_post(url, json, headers, timeout, **kw):
+        captured["max_tokens"] = json["max_tokens"]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    VLLMBackend(base_url="http://x/v1", model="m").ocr_image(
+        img, InferenceParams(max_output_tokens=4096)
+    )
+    assert captured["max_tokens"] == 4096
+
+
+def test_env_max_pixels_changes_sent_image_size(monkeypatch, tmp_path):
+    import importlib
+
+    import qwen_ocr.config as cfg
+
+    img = tmp_path / "p.png"
+    Image.new("RGB", (2480, 3508), "white").save(img)
+    baseline_max = cfg.MAX_PIXELS
+    _, low_metrics = _encode_image(img, cfg.MIN_PIXELS, baseline_max)
+    monkeypatch.setenv("QWEN_OCR_MAX_PIXELS", str(baseline_max * 4))
+    importlib.reload(cfg)
+    _, high_metrics = _encode_image(img, cfg.MIN_PIXELS, cfg.MAX_PIXELS)
+    assert high_metrics.sent_megapixels > low_metrics.sent_megapixels
+    monkeypatch.delenv("QWEN_OCR_MAX_PIXELS", raising=False)
+    importlib.reload(cfg)
+
+
 def test_ollama_path_uses_same_encode_budget(monkeypatch, tmp_path):
     # Ollama inherits base.ocr_image; pixel budget must apply (issue #5 / audit item 5).
     img = tmp_path / "p.png"

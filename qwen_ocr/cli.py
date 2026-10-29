@@ -2,7 +2,8 @@
 
     qwen-ocr process <path-or-dir> [-o <out>] [--backend auto|ollama|vllm|api]
                      [--prefer cost|quality|speed] [--model M] [--dpi N]
-                     [--min-pixels N] [--max-pixels N] [--thinking/--no-thinking]
+                     [--min-pixels N] [--max-pixels N] [--max-output-tokens N]
+                     [--thinking/--no-thinking]
                      [--save-raw DIR] [--message-order text-first|image-first]
                      [-w N] [-q] [--verbose] [--reprocess]
     qwen-ocr backends
@@ -90,6 +91,13 @@ def main() -> None:
     "Raise deliberately for dense tables.",
 )
 @click.option(
+    "--max-output-tokens",
+    type=int,
+    default=config.MAX_OUTPUT_TOKENS,
+    show_default=True,
+    help="Completion token budget per page (env: QWEN_OCR_MAX_OUTPUT_TOKENS).",
+)
+@click.option(
     "--thinking/--no-thinking",
     "thinking",
     default=config.ENABLE_THINKING,
@@ -124,6 +132,7 @@ def process_cmd(
     workers,
     min_pixels,
     max_pixels,
+    max_output_tokens,
     thinking,
     reprocess,
     quiet,
@@ -159,6 +168,7 @@ def process_cmd(
         enable_thinking=thinking,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
+        max_output_tokens=max_output_tokens,
         message_order=message_order,
         save_raw_dir=save_raw,
     )

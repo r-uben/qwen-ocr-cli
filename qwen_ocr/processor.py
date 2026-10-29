@@ -47,7 +47,7 @@ from ocr_output_contract import (
 )
 
 from qwen_ocr.backends.base import Backend, OcrImageResult
-from qwen_ocr.config import InferenceParams
+from qwen_ocr.config import DEFAULT_MESSAGE_ORDER, InferenceParams
 from qwen_ocr.utils import sanitize_filename, strip_thinking, trim_degenerate_tail
 
 # Per-document page telemetry (machine-readable for socr / A/B analysis).
@@ -125,18 +125,48 @@ def _page_sidecar_record(page: int, result: OcrImageResult) -> dict[str, Any]:
     }
 
 
-def _write_pages_sidecar(doc_dir: Path, records: list[dict[str, Any]]) -> None:
+def _page_sidecar_error_record(
+    page: int,
+    error: str,
+    params: InferenceParams,
+    *,
+    model: str,
+) -> dict[str, Any]:
+    return {
+        "page": page,
+        "finish_reason": None,
+        "error": error,
+        "model": model,
+        "min_pixels": params.min_pixels,
+        "max_pixels": params.max_pixels,
+    }
+
+
+def _try_write_pages_sidecar(doc_dir: Path, records: list[dict[str, Any]]) -> None:
+    """Rewrite ``pages.jsonl`` for this run (truncates any stale file)."""
     path = doc_dir / PAGES_SIDECAR_NAME
-    with path.open("w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("failed to write page sidecar %s: %s", path, exc)
 
 
 def _save_raw_page(raw_dir: Path, rel_key: str, page: int, text: str) -> None:
-    stem = rel_key.replace("/", "__")
-    dest = raw_dir / stem
-    dest.mkdir(parents=True, exist_ok=True)
-    (dest / f"page_{page:04d}.raw.txt").write_text(text, encoding="utf-8")
+    try:
+        stem = rel_key.replace("/", "__")
+        dest = raw_dir / stem
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"page_{page:04d}.raw.txt").write_text(text, encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "failed to save raw OCR output for %s page %d under %s: %s",
+            rel_key,
+            page,
+            raw_dir,
+            exc,
+        )
 
 
 def _process_ocr_result(raw: OcrImageResult) -> str:
@@ -176,6 +206,7 @@ def _ocr_pages(
     page_errors: dict[int, str] = {}
     sidecar_records: list[dict[str, Any]] = []
     raw_key = save_raw_rel_key or rel_key or source.name
+    model_id = _backend_model(backend)
     for idx, image in enumerate(images, start=1):
         try:
             ocr = backend.ocr_image(image, params)
@@ -188,6 +219,10 @@ def _ocr_pages(
             pages.append(text)
         except Exception as exc:
             logger.error("OCR failed for page %d of %s: %s", idx, source.name, exc)
+            if not sidecar_records or sidecar_records[-1].get("page") != idx:
+                sidecar_records.append(
+                    _page_sidecar_error_record(idx, str(exc), params, model=model_id)
+                )
             page_errors[idx] = str(exc)
             pages.append(f"*[OCR failed for page {idx}]*")
     return DocResult(
@@ -286,8 +321,9 @@ def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str
         "max_pixels": params.max_pixels,
         "prompt": params.prompt,
         "enable_thinking": params.enable_thinking,
-        "message_order": params.message_order,
     }
+    if params.message_order != DEFAULT_MESSAGE_ORDER:
+        extra["message_order"] = params.message_order
     return run_fingerprint(_backend_model(backend), backend.name, extra=extra)
 
 
@@ -390,8 +426,7 @@ def _write_document(
 
     meta = _build_doc_metadata(result, markdown_path, output_root, backend, fingerprint)
     write_doc_metadata(doc_dir, rel_key, meta)
-    if result.pages_sidecar:
-        _write_pages_sidecar(doc_dir, result.pages_sidecar)
+    _try_write_pages_sidecar(doc_dir, result.pages_sidecar)
     index.record(rel_key, meta)
     return meta, markdown_path
 
