@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 
 import fitz
-from ocr_output_contract import UNREADABLE_CHECKSUM, Status
+from ocr_output_contract import UNREADABLE_CHECKSUM, Status, run_fingerprint
 from PIL import Image
 
 from qwen_ocr.backends.base import Availability, Backend
 from qwen_ocr.config import InferenceParams
-from qwen_ocr.processor import process
+from qwen_ocr.processor import PAGES_SIDECAR_NAME, _run_fingerprint, process
 from qwen_ocr.utils import strip_thinking, trim_degenerate_tail
+from tests.ocr_helpers import fake_ocr_result
 
 
 class FakeBackend(Backend):
@@ -29,7 +30,7 @@ class FakeBackend(Backend):
 
     def ocr_image(self, image_path, params):
         self.calls += 1
-        return self.text
+        return fake_ocr_result(self.text, model="fake-model")
 
 
 def _make_pdf(path, pages=2):
@@ -215,6 +216,31 @@ def test_dpi_change_invalidates_cache(tmp_path):
     assert b3.calls == 1  # different dpi -> reprocessed, not skipped
 
 
+def test_default_fingerprint_unchanged_without_message_order():
+    # Default text-first must not appear in the fingerprint extra (cache-compatible).
+    backend = FakeBackend()
+    params = InferenceParams()
+    fp = _run_fingerprint(backend, 120, params)
+    extra = {
+        "dpi": 120,
+        "max_output_tokens": params.max_output_tokens,
+        "temperature": params.temperature,
+        "repetition_penalty": params.repetition_penalty,
+        "min_pixels": params.min_pixels,
+        "max_pixels": params.max_pixels,
+        "prompt": params.prompt,
+        "enable_thinking": params.enable_thinking,
+    }
+    assert fp == run_fingerprint("fake-model", "fake", extra=extra)
+
+
+def test_image_first_message_order_changes_fingerprint():
+    backend = FakeBackend()
+    default_fp = _run_fingerprint(backend, 120, InferenceParams())
+    ab_fp = _run_fingerprint(backend, 120, InferenceParams(message_order="image-first"))
+    assert ab_fp != default_fp
+
+
 def test_inference_params_change_invalidates_cache(tmp_path):
     # Output-affecting inference params (e.g. prompt) are in the fingerprint too.
     pdf = tmp_path / "doc.pdf"
@@ -360,7 +386,8 @@ def test_partial_failure_exits_nonzero(tmp_path):
     class FlakyBackend(FakeBackend):
         def ocr_image(self, image_path, params):
             self.calls += 1
-            return "good page" if self.calls == 1 else ""
+            text = "good page" if self.calls == 1 else ""
+            return fake_ocr_result(text, model="fake-model")
 
     outcome = process(pdf, FlakyBackend(), InferenceParams(), dpi=120, output_dir=out)
     assert outcome.exit_code != 0
@@ -384,6 +411,61 @@ def test_backend_error_is_isolated_per_page(tmp_path):
     assert outcome.exit_code != 0
     doc_meta = json.loads((out / "doc" / "metadata.json").read_text())
     assert "model exploded" in doc_meta["error"]
+    sidecar = json.loads((out / "doc" / PAGES_SIDECAR_NAME).read_text().strip())
+    assert sidecar["finish_reason"] is None and sidecar["error"] == "model exploded"
+
+
+def test_empty_with_finish_reason_stop_fails_page(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    class EmptyStop(FakeBackend):
+        def ocr_image(self, image_path, params):
+            return fake_ocr_result("", finish_reason="stop")
+
+    outcome = process(pdf, EmptyStop(), InferenceParams(), dpi=120, output_dir=out)
+    assert outcome.exit_code != 0
+    rec = json.loads((out / "doc" / PAGES_SIDECAR_NAME).read_text().strip())
+    assert rec["finish_reason"] == "stop"
+
+
+def test_pages_jsonl_rewritten_not_stale(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+    sidecar = out / "doc" / PAGES_SIDECAR_NAME
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text('{"page": 99, "stale": true}\n', encoding="utf-8")
+
+    process(pdf, FakeBackend("ok"), InferenceParams(), dpi=120, output_dir=out)
+    lines = sidecar.read_text().strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["page"] == 1
+
+
+def test_save_raw_io_failure_does_not_fail_successful_page(tmp_path):
+    import os
+    import stat
+
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    os.chmod(raw_dir, stat.S_IRUSR | stat.S_IXUSR)  # no write: save-raw mkdir/write fails
+    try:
+        outcome = process(
+            pdf,
+            FakeBackend("page ok"),
+            InferenceParams(save_raw_dir=raw_dir),
+            dpi=120,
+            output_dir=out,
+        )
+    finally:
+        os.chmod(raw_dir, stat.S_IRWXU)
+    assert outcome.exit_code == 0
+    assert "page ok" in (out / "doc" / "doc.md").read_text()
 
 
 def test_trim_degenerate_tail():
@@ -402,6 +484,54 @@ def test_strip_thinking_removes_reasoning_block():
     # Unmatched/absent tags leave real page text alone.
     body = "The value of <think> in the model is discussed"
     assert strip_thinking(body) == body
+
+
+def test_truncated_response_is_page_failure(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    class Truncated(FakeBackend):
+        def ocr_image(self, image_path, params):
+            return fake_ocr_result("partial text", finish_reason="length")
+
+    outcome = process(pdf, Truncated(), InferenceParams(), dpi=120, output_dir=out)
+    assert outcome.exit_code != 0
+    doc_meta = json.loads((out / "doc" / "metadata.json").read_text())
+    assert "truncated" in (doc_meta["error"] or "").lower()
+    sidecar = (out / "doc" / PAGES_SIDECAR_NAME).read_text().strip().splitlines()
+    assert json.loads(sidecar[0])["finish_reason"] == "length"
+
+
+def test_pages_jsonl_sidecar_written(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=2)
+    out = tmp_path / "out"
+    process(pdf, FakeBackend("x"), InferenceParams(), dpi=120, output_dir=out)
+    lines = (out / "doc" / PAGES_SIDECAR_NAME).read_text().strip().splitlines()
+    assert len(lines) == 2
+    rec = json.loads(lines[0])
+    assert rec["page"] == 1
+    assert "image_sent" in rec and "usage" in rec
+    assert rec["usage"]["prompt_tokens"] == 10
+
+
+def test_save_raw_writes_before_cleanup(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+    raw_dir = tmp_path / "raw"
+    raw_body = "<think>reason</think>\nclean"
+    process(
+        pdf,
+        FakeBackend(raw_body),
+        InferenceParams(save_raw_dir=raw_dir),
+        dpi=120,
+        output_dir=out,
+    )
+    raw_file = raw_dir / "doc.pdf" / "page_0001.raw.txt"
+    assert raw_body in raw_file.read_text()
+    assert "reason" not in (out / "doc" / "doc.md").read_text()
 
 
 def test_page_text_is_stripped_of_thinking(tmp_path):

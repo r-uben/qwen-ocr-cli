@@ -18,11 +18,13 @@ success reported as ok.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ocr_output_contract import (
     UNREADABLE_CHECKSUM,
@@ -44,9 +46,12 @@ from ocr_output_contract import (
     write_doc_metadata,
 )
 
-from qwen_ocr.backends.base import Backend
-from qwen_ocr.config import InferenceParams
+from qwen_ocr.backends.base import Backend, OcrImageResult
+from qwen_ocr.config import DEFAULT_MESSAGE_ORDER, InferenceParams
 from qwen_ocr.utils import sanitize_filename, strip_thinking, trim_degenerate_tail
+
+# Per-document page telemetry (machine-readable for socr / A/B analysis).
+PAGES_SIDECAR_NAME = "pages.jsonl"
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,7 @@ class DocResult:
     processing_time: float = 0.0
     page_errors: dict[int, str] = field(default_factory=dict)
     error: str | None = None
+    pages_sidecar: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def page_count(self) -> int:
@@ -95,12 +101,98 @@ class DocResult:
 # ---------------------------------------------------------------------------
 
 
+def _page_sidecar_record(page: int, result: OcrImageResult) -> dict[str, Any]:
+    return {
+        "page": page,
+        "finish_reason": result.finish_reason,
+        "model": result.model,
+        "min_pixels": result.image.min_pixels,
+        "max_pixels": result.image.max_pixels,
+        "image_original": {
+            "width": result.image.original_width,
+            "height": result.image.original_height,
+            "megapixels": round(result.image.original_megapixels, 4),
+        },
+        "image_sent": {
+            "width": result.image.sent_width,
+            "height": result.image.sent_height,
+            "megapixels": round(result.image.sent_megapixels, 4),
+        },
+        "usage": {
+            "prompt_tokens": result.usage.prompt_tokens,
+            "completion_tokens": result.usage.completion_tokens,
+        },
+    }
+
+
+def _page_sidecar_error_record(
+    page: int,
+    error: str,
+    params: InferenceParams,
+    *,
+    model: str,
+) -> dict[str, Any]:
+    return {
+        "page": page,
+        "finish_reason": None,
+        "error": error,
+        "model": model,
+        "min_pixels": params.min_pixels,
+        "max_pixels": params.max_pixels,
+    }
+
+
+def _try_write_pages_sidecar(doc_dir: Path, records: list[dict[str, Any]]) -> None:
+    """Rewrite ``pages.jsonl`` for this run (truncates any stale file)."""
+    path = doc_dir / PAGES_SIDECAR_NAME
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("failed to write page sidecar %s: %s", path, exc)
+
+
+def _save_raw_page(raw_dir: Path, rel_key: str, page: int, text: str) -> None:
+    try:
+        stem = rel_key.replace("/", "__")
+        dest = raw_dir / stem
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"page_{page:04d}.raw.txt").write_text(text, encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "failed to save raw OCR output for %s page %d under %s: %s",
+            rel_key,
+            page,
+            raw_dir,
+            exc,
+        )
+
+
+def _process_ocr_result(raw: OcrImageResult) -> str:
+    """Validate finish_reason and return cleaned markdown.
+
+    Truncated responses (``finish_reason`` / Ollama ``done_reason`` in
+    :data:`TRUNCATION_REASONS`) are per-page failures — never written as complete OCR.
+    """
+    if raw.truncated:
+        reason = raw.finish_reason or "length"
+        raise ValueError(
+            f"OCR response truncated (finish_reason={reason}); "
+            "partial transcription rejected — raise --max-output-tokens or split the page"
+        )
+    return trim_degenerate_tail(strip_thinking(raw.text))
+
+
 def _ocr_pages(
     source: Path,
     images: list[Path],
     backend: Backend,
     params: InferenceParams,
     start: float,
+    *,
+    rel_key: str | None = None,
+    save_raw_rel_key: str | None = None,
 ) -> DocResult:
     """OCR an ordered list of page-image paths into a DocResult.
 
@@ -112,15 +204,25 @@ def _ocr_pages(
     """
     pages: list[str] = []
     page_errors: dict[int, str] = {}
+    sidecar_records: list[dict[str, Any]] = []
+    raw_key = save_raw_rel_key or rel_key or source.name
+    model_id = _backend_model(backend)
     for idx, image in enumerate(images, start=1):
         try:
-            text = backend.ocr_image(image, params)
-            text = trim_degenerate_tail(strip_thinking(text))
+            ocr = backend.ocr_image(image, params)
+            sidecar_records.append(_page_sidecar_record(idx, ocr))
+            if params.save_raw_dir is not None:
+                _save_raw_page(params.save_raw_dir, raw_key, idx, ocr.text)
+            text = _process_ocr_result(ocr)
             if not text.strip():
                 raise ValueError("empty OCR response (no text returned)")
             pages.append(text)
         except Exception as exc:
             logger.error("OCR failed for page %d of %s: %s", idx, source.name, exc)
+            if not sidecar_records or sidecar_records[-1].get("page") != idx:
+                sidecar_records.append(
+                    _page_sidecar_error_record(idx, str(exc), params, model=model_id)
+                )
             page_errors[idx] = str(exc)
             pages.append(f"*[OCR failed for page {idx}]*")
     return DocResult(
@@ -128,6 +230,7 @@ def _ocr_pages(
         pages=pages,
         processing_time=time.time() - start,
         page_errors=page_errors,
+        pages_sidecar=sidecar_records,
     )
 
 
@@ -136,17 +239,23 @@ def _ocr_one_document(
     backend: Backend,
     params: InferenceParams,
     dpi: int,
+    *,
+    rel_key: str | None = None,
 ) -> DocResult:
     """OCR one document, rendering a PDF to PNGs inside a live temp directory."""
     start = time.time()
     try:
         if doc.is_dir():
             images = _gather_images(doc)
-            return _ocr_pages(doc, images, backend, params, start)
+            return _ocr_pages(
+                doc, images, backend, params, start, save_raw_rel_key=rel_key or doc.name
+            )
         if doc.suffix.lower() in _DOC_SUFFIXES:
             with tempfile.TemporaryDirectory() as tmp:
                 images = _render_pdf(doc, Path(tmp), dpi)
-                return _ocr_pages(doc, images, backend, params, start)
+                return _ocr_pages(
+                    doc, images, backend, params, start, save_raw_rel_key=rel_key or doc.stem
+                )
         raise ValueError(f"unsupported input: {doc} (expected a .pdf or a directory)")
     except Exception as exc:
         logger.error("could not process %s: %s", doc, exc)
@@ -213,6 +322,8 @@ def _run_fingerprint(backend: Backend, dpi: int, params: InferenceParams) -> str
         "prompt": params.prompt,
         "enable_thinking": params.enable_thinking,
     }
+    if params.message_order != DEFAULT_MESSAGE_ORDER:
+        extra["message_order"] = params.message_order
     return run_fingerprint(_backend_model(backend), backend.name, extra=extra)
 
 
@@ -315,6 +426,7 @@ def _write_document(
 
     meta = _build_doc_metadata(result, markdown_path, output_root, backend, fingerprint)
     write_doc_metadata(doc_dir, rel_key, meta)
+    _try_write_pages_sidecar(doc_dir, result.pages_sidecar)
     index.record(rel_key, meta)
     return meta, markdown_path
 
@@ -387,7 +499,7 @@ def process(
             )
             continue
 
-        result = _ocr_one_document(doc, backend, params, dpi)
+        result = _ocr_one_document(doc, backend, params, dpi, rel_key=rel_key)
         meta, markdown_path = _write_document(
             result, output_root, rel_key, backend, index, fingerprint
         )

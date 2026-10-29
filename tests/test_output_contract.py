@@ -27,6 +27,7 @@ from ocr_output_contract.conformance import ExpectedDoc, assert_conforms
 from qwen_ocr.backends.base import Availability, Backend
 from qwen_ocr.config import InferenceParams
 from qwen_ocr.processor import process
+from tests.ocr_helpers import fake_ocr_result
 
 
 class FakeBackend(Backend):
@@ -47,7 +48,7 @@ class FakeBackend(Backend):
 
     def ocr_image(self, image_path, params):
         self.calls += 1
-        return self.text
+        return fake_ocr_result(self.text, model=self._model)
 
 
 def _make_pdf(path, pages=2):
@@ -71,7 +72,7 @@ def test_multipage_pdf_conforms_no_data_loss(tmp_path):
     class PerPage(FakeBackend):
         def ocr_image(self, image_path, params):
             counter["n"] += 1
-            return f"PAGE-{counter['n']}-CONTENT"
+            return fake_ocr_result(f"PAGE-{counter['n']}-CONTENT", model=self._model)
 
     outcome = process(pdf, PerPage(), InferenceParams(), dpi=120, output_dir=out)
     assert outcome.exit_code == 0
@@ -120,7 +121,8 @@ def test_partial_pdf_conforms_with_partial_status(tmp_path):
     class Flaky(FakeBackend):
         def ocr_image(self, image_path, params):
             self.calls += 1
-            return "good content" if self.calls == 1 else ""
+            text = "good content" if self.calls == 1 else ""
+            return fake_ocr_result(text, model=self._model)
 
     outcome = process(pdf, Flaky(), InferenceParams(), dpi=120, output_dir=out)
     assert outcome.exit_code != 0
