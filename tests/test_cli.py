@@ -7,7 +7,6 @@ from click.testing import CliRunner
 
 from qwen_ocr import cli
 from qwen_ocr.backends.base import Availability, Backend
-
 from tests.ocr_helpers import fake_ocr_result
 
 

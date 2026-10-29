@@ -136,9 +136,7 @@ def test_smart_resize_honours_raised_ceiling():
 
 
 def test_extract_text_happy():
-    data = {
-        "choices": [{"message": {"content": "# Title\n\nbody"}, "finish_reason": "stop"}]
-    }
+    data = {"choices": [{"message": {"content": "# Title\n\nbody"}, "finish_reason": "stop"}]}
     assert _extract_text(data) == "# Title\n\nbody"
     text, reason = _extract_text_and_finish_reason(data)
     assert text == "# Title\n\nbody" and reason == "stop"

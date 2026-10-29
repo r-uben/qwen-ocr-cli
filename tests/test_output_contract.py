@@ -27,7 +27,6 @@ from ocr_output_contract.conformance import ExpectedDoc, assert_conforms
 from qwen_ocr.backends.base import Availability, Backend
 from qwen_ocr.config import InferenceParams
 from qwen_ocr.processor import process
-
 from tests.ocr_helpers import fake_ocr_result
 
 

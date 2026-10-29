@@ -12,7 +12,6 @@ from qwen_ocr.backends.base import Availability, Backend
 from qwen_ocr.config import InferenceParams
 from qwen_ocr.processor import PAGES_SIDECAR_NAME, process
 from qwen_ocr.utils import strip_thinking, trim_degenerate_tail
-
 from tests.ocr_helpers import fake_ocr_result
 
 

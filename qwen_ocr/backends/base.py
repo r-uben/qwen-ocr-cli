@@ -243,7 +243,9 @@ def _post_with_5xx_retry(
 
 
 def _encode_image(
-    image_path: Path, min_pixels: int, max_pixels: int
+    image_path: Path,
+    min_pixels: int,
+    max_pixels: int,
 ) -> tuple[str, ImageSendMetrics]:
     """Base64 data URL, resized to the patch-aligned pixel budget (issue #5).
 
