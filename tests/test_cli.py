@@ -82,7 +82,7 @@ def test_pixel_budget_is_reported_and_flags_thread_through(monkeypatch, tmp_path
         def ocr_image(self, image_path, params):
             seen["min"] = params.min_pixels
             seen["max"] = params.max_pixels
-            return self.text
+            return fake_ocr_result(self.text, model="fake-model")
 
     monkeypatch.setattr(cli, "make_backend", lambda name, model=None: Recording())
     res = CliRunner().invoke(
