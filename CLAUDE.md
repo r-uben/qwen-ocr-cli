@@ -31,6 +31,9 @@ qwen-ocr backends           # human-readable: which backends are live
 - Metadata at both levels via `DocMetadata` + `write_doc_metadata` + `RootIndex` (per-doc
   sidecar AND a root index keyed by input-relative path). Failures recorded `status="failed"`.
 - An **empty/whitespace model response is a per-page FAILURE** (QWEN-02), never a 0-byte "ok".
+- A **truncated model response** (`finish_reason` / Ollama `done_reason` = `length`) is also a
+  per-page FAILURE (partial text is never written as complete OCR). Per-page telemetry lives in
+  `<doc>/pages.jsonl` (finish_reason, image sizes, token usage, model).
 - Exit code via `RunOutcome.exit_code`: nonzero if any document/page failed.
 - `-q` emits output `.md` paths only; non-zero exit ⇒ `socr` marks the page CLI_ERROR.
 
@@ -40,7 +43,7 @@ QWEN-02 empty-response cases). Run it on any change to output writing.
 
 ## Backends (`qwen_ocr/backends/`)
 
-One module per backend, all behind a common `Backend` protocol (`ocr_image(png) -> str`):
+One module per backend, all behind a common `Backend` protocol (`ocr_image(png) -> OcrImageResult`):
 - `ollama.py` — local `qwen3-vl` via Ollama HTTP. Free. Probe: model pulled + daemon up.
 - `vllm.py` — OpenAI-compatible vLLM server (HPC). Free. Probe: `VLLM_BASE_URL` reachable.
 - `api.py` — DashScope / OpenRouter. Paid. Probe: API key env set.

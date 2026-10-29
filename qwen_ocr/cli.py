@@ -3,6 +3,7 @@
     qwen-ocr process <path-or-dir> [-o <out>] [--backend auto|ollama|vllm|api]
                      [--prefer cost|quality|speed] [--model M] [--dpi N]
                      [--min-pixels N] [--max-pixels N] [--thinking/--no-thinking]
+                     [--save-raw DIR] [--message-order text-first|image-first]
                      [-w N] [-q] [--verbose] [--reprocess]
     qwen-ocr backends
     qwen-ocr --version
@@ -99,6 +100,20 @@ def main() -> None:
 @click.option("--reprocess", is_flag=True, help="Re-OCR documents already recorded completed.")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress; emit output paths only.")
 @click.option("--verbose", is_flag=True, help="Verbose logging.")
+@click.option(
+    "--save-raw",
+    "save_raw",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory to write raw model output per page (before cleanup).",
+)
+@click.option(
+    "--message-order",
+    type=click.Choice(["text-first", "image-first"]),
+    default=config.DEFAULT_MESSAGE_ORDER,
+    show_default=True,
+    help="Order of image vs prompt in the vision chat message (A/B).",
+)
 def process_cmd(
     source,
     output,
@@ -113,6 +128,8 @@ def process_cmd(
     reprocess,
     quiet,
     verbose,
+    save_raw,
+    message_order,
 ):
     """Process a PDF (or a directory of page images / a tree of PDFs)."""
     logging.basicConfig(
@@ -138,7 +155,13 @@ def process_cmd(
         raise click.ClickException(
             f"--min-pixels ({min_pixels}) exceeds --max-pixels ({max_pixels})"
         )
-    params = InferenceParams(enable_thinking=thinking, min_pixels=min_pixels, max_pixels=max_pixels)
+    params = InferenceParams(
+        enable_thinking=thinking,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        message_order=message_order,
+        save_raw_dir=save_raw,
+    )
     try:
         outcome = process(
             Path(source),

@@ -10,8 +10,10 @@ from PIL import Image
 
 from qwen_ocr.backends.base import Availability, Backend
 from qwen_ocr.config import InferenceParams
-from qwen_ocr.processor import process
+from qwen_ocr.processor import PAGES_SIDECAR_NAME, process
 from qwen_ocr.utils import strip_thinking, trim_degenerate_tail
+
+from tests.ocr_helpers import fake_ocr_result
 
 
 class FakeBackend(Backend):
@@ -29,7 +31,7 @@ class FakeBackend(Backend):
 
     def ocr_image(self, image_path, params):
         self.calls += 1
-        return self.text
+        return fake_ocr_result(self.text, model="fake-model")
 
 
 def _make_pdf(path, pages=2):
@@ -360,7 +362,8 @@ def test_partial_failure_exits_nonzero(tmp_path):
     class FlakyBackend(FakeBackend):
         def ocr_image(self, image_path, params):
             self.calls += 1
-            return "good page" if self.calls == 1 else ""
+            text = "good page" if self.calls == 1 else ""
+            return fake_ocr_result(text, model="fake-model")
 
     outcome = process(pdf, FlakyBackend(), InferenceParams(), dpi=120, output_dir=out)
     assert outcome.exit_code != 0
@@ -402,6 +405,54 @@ def test_strip_thinking_removes_reasoning_block():
     # Unmatched/absent tags leave real page text alone.
     body = "The value of <think> in the model is discussed"
     assert strip_thinking(body) == body
+
+
+def test_truncated_response_is_page_failure(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    class Truncated(FakeBackend):
+        def ocr_image(self, image_path, params):
+            return fake_ocr_result("partial text", finish_reason="length")
+
+    outcome = process(pdf, Truncated(), InferenceParams(), dpi=120, output_dir=out)
+    assert outcome.exit_code != 0
+    doc_meta = json.loads((out / "doc" / "metadata.json").read_text())
+    assert "truncated" in (doc_meta["error"] or "").lower()
+    sidecar = (out / "doc" / PAGES_SIDECAR_NAME).read_text().strip().splitlines()
+    assert json.loads(sidecar[0])["finish_reason"] == "length"
+
+
+def test_pages_jsonl_sidecar_written(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=2)
+    out = tmp_path / "out"
+    process(pdf, FakeBackend("x"), InferenceParams(), dpi=120, output_dir=out)
+    lines = (out / "doc" / PAGES_SIDECAR_NAME).read_text().strip().splitlines()
+    assert len(lines) == 2
+    rec = json.loads(lines[0])
+    assert rec["page"] == 1
+    assert "image_sent" in rec and "usage" in rec
+    assert rec["usage"]["prompt_tokens"] == 10
+
+
+def test_save_raw_writes_before_cleanup(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+    raw_dir = tmp_path / "raw"
+    raw_body = "<think>reason</think>\nclean"
+    process(
+        pdf,
+        FakeBackend(raw_body),
+        InferenceParams(save_raw_dir=raw_dir),
+        dpi=120,
+        output_dir=out,
+    )
+    raw_file = raw_dir / "doc.pdf" / "page_0001.raw.txt"
+    assert raw_body in raw_file.read_text()
+    assert "reason" not in (out / "doc" / "doc.md").read_text()
 
 
 def test_page_text_is_stripped_of_thinking(tmp_path):

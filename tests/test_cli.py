@@ -8,6 +8,8 @@ from click.testing import CliRunner
 from qwen_ocr import cli
 from qwen_ocr.backends.base import Availability, Backend
 
+from tests.ocr_helpers import fake_ocr_result
+
 
 class FakeBackend(Backend):
     name = "fake"
@@ -22,7 +24,7 @@ class FakeBackend(Backend):
         return ("http://x/v1", None, "fake-model")
 
     def ocr_image(self, image_path, params):
-        return self.text
+        return fake_ocr_result(self.text, model="fake-model")
 
 
 def _make_pdf(path, pages=1):

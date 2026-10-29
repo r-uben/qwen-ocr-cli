@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
 # --- Backend endpoints / models (env override → default) ---
 OLLAMA_URL = os.environ.get("QWEN_OCR_OLLAMA_URL", "http://localhost:11434/v1")
@@ -61,6 +63,10 @@ REQUEST_TIMEOUT = 300.0
 # default, with `--thinking` as the escape hatch. See issue #4.
 ENABLE_THINKING = False
 
+# User-message part order for the vision chat call (A/B with image-first).
+MessageOrder = Literal["text-first", "image-first"]
+DEFAULT_MESSAGE_ORDER: MessageOrder = "text-first"
+
 OCR_PROMPT = (
     "Transcribe all text in this image into clean Markdown. "
     "Preserve document structure: headings, lists, and paragraphs. "
@@ -81,3 +87,5 @@ class InferenceParams:
     timeout: float = REQUEST_TIMEOUT
     prompt: str = OCR_PROMPT
     enable_thinking: bool = ENABLE_THINKING
+    message_order: MessageOrder = DEFAULT_MESSAGE_ORDER
+    save_raw_dir: Path | None = None

@@ -10,7 +10,13 @@ from PIL import Image
 
 from qwen_ocr import config
 from qwen_ocr.backends.api import ApiBackend
-from qwen_ocr.backends.base import _encode_image, _extract_text
+from qwen_ocr.backends.base import (
+    OcrImageResult,
+    _encode_image,
+    _extract_finish_reason,
+    _extract_text,
+    _extract_text_and_finish_reason,
+)
 from qwen_ocr.backends.ollama import OllamaBackend
 from qwen_ocr.backends.vllm import VLLMBackend
 from qwen_ocr.config import InferenceParams
@@ -98,8 +104,9 @@ def test_encode_image_downscales_into_budget(tmp_path):
     # Issue #5: a 300-DPI A4 page (~8.7 MP) must arrive inside the cookbook budget.
     img = tmp_path / "p.png"
     Image.new("RGB", (2480, 3508), "white").save(img)
-    url = _encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS)
+    url, metrics = _encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS)
     assert url.startswith("data:image/png;base64,")
+    assert metrics.sent_width * metrics.sent_height <= config.MAX_PIXELS
     w, h = _decoded_size(url)
     assert w * h <= config.MAX_PIXELS
     assert w % config.PATCH_FACTOR == 0 and h % config.PATCH_FACTOR == 0
@@ -110,7 +117,8 @@ def test_encode_image_upscales_tiny_page(tmp_path):
     # Below min_pixels the processor would pad an under-resolved page; scale it up.
     img = tmp_path / "p.png"
     Image.new("RGB", (200, 300), "white").save(img)
-    w, h = _decoded_size(_encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS))
+    url, _ = _encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS)
+    w, h = _decoded_size(url)
     assert w * h >= config.MIN_PIXELS
 
 
@@ -127,13 +135,59 @@ def test_smart_resize_honours_raised_ceiling():
 
 
 def test_extract_text_happy():
-    data = {"choices": [{"message": {"content": "# Title\n\nbody"}}]}
+    data = {
+        "choices": [{"message": {"content": "# Title\n\nbody"}, "finish_reason": "stop"}]
+    }
     assert _extract_text(data) == "# Title\n\nbody"
+    text, reason = _extract_text_and_finish_reason(data)
+    assert text == "# Title\n\nbody" and reason == "stop"
+
+
+def test_extract_text_empty_with_stop_is_empty():
+    data = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+    text, reason = _extract_text_and_finish_reason(data)
+    assert text == "" and reason == "stop"
+
+
+def test_extract_finish_reason_openai_length():
+    data = {"choices": [{"message": {"content": "partial"}, "finish_reason": "length"}]}
+    assert _extract_finish_reason(data) == "length"
+
+
+def test_extract_finish_reason_ollama_done_reason():
+    data = {
+        "choices": [{"message": {"content": "partial"}}],
+        "done_reason": "length",
+    }
+    assert _extract_finish_reason(data) == "length"
+
+
+def test_extract_usage_openai_and_ollama():
+    oai = {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "choices": [{}]}
+    from qwen_ocr.backends.base import _extract_usage
+
+    u = _extract_usage(oai)
+    assert u.prompt_tokens == 100 and u.completion_tokens == 50
+    ollama = {"prompt_eval_count": 80, "eval_count": 40, "choices": [{}]}
+    u2 = _extract_usage(ollama)
+    assert u2.prompt_tokens == 80 and u2.completion_tokens == 40
 
 
 def test_extract_text_malformed_raises():
     with pytest.raises(ValueError):
         _extract_text({"nope": 1})
+
+
+def test_encode_image_sent_size_grows_with_max_pixels(tmp_path):
+    img = tmp_path / "p.png"
+    Image.new("RGB", (2480, 3508), "white").save(img)
+    low_url, low_m = _encode_image(img, config.MIN_PIXELS, config.MAX_PIXELS)
+    high_ceiling = config.MAX_PIXELS * 4
+    high_url, high_m = _encode_image(img, config.MIN_PIXELS, high_ceiling)
+    assert low_m.sent_megapixels < high_m.sent_megapixels
+    assert _decoded_size(high_url)[0] * _decoded_size(high_url)[1] > _decoded_size(low_url)[
+        0
+    ] * _decoded_size(low_url)[1]
 
 
 def test_ocr_image_posts_and_parses(monkeypatch, tmp_path):
@@ -153,7 +207,9 @@ def test_ocr_image_posts_and_parses(monkeypatch, tmp_path):
 
     monkeypatch.setattr(httpx, "post", fake_post)
     out = VLLMBackend(base_url="http://x/v1", model="m").ocr_image(img, InferenceParams())
-    assert out == "ok text"
+    assert isinstance(out, OcrImageResult)
+    assert out.text == "ok text"
+    assert out.finish_reason is None
     assert captured["url"].endswith("/chat/completions")
     assert captured["model"] == "m"
 
@@ -200,6 +256,69 @@ def test_thinking_flag_leaves_server_default_alone(monkeypatch, tmp_path):
         InferenceParams(enable_thinking=True),
     )
     assert "chat_template_kwargs" not in body and "think" not in body
+
+
+def test_truncated_finish_reason_surfaces_in_result(monkeypatch, tmp_path):
+    img = tmp_path / "p.png"
+    Image.new("RGB", (100, 100), "white").save(img)
+
+    def fake_post(url, json, headers, timeout, **kw):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "cut off"}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    out = VLLMBackend(base_url="http://x/v1", model="m").ocr_image(img, InferenceParams())
+    assert out.truncated and out.finish_reason == "length"
+
+
+def test_message_order_image_first(monkeypatch, tmp_path):
+    img = tmp_path / "p.png"
+    Image.new("RGB", (100, 100), "white").save(img)
+    captured = {}
+
+    def fake_post(url, json, headers, timeout, **kw):
+        captured["content"] = json["messages"][0]["content"]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    VLLMBackend(base_url="http://x/v1", model="m").ocr_image(
+        img, InferenceParams(message_order="image-first")
+    )
+    parts = captured["content"]
+    assert parts[0]["type"] == "image_url" and parts[1]["type"] == "text"
+
+
+def test_ollama_path_uses_same_encode_budget(monkeypatch, tmp_path):
+    # Ollama inherits base.ocr_image; pixel budget must apply (issue #5 / audit item 5).
+    img = tmp_path / "p.png"
+    Image.new("RGB", (2480, 3508), "white").save(img)
+    captured = {}
+
+    def fake_post(url, json, headers, timeout, **kw):
+        captured["url"] = json["messages"][0]["content"][1]["image_url"]["url"]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    b = OllamaBackend(base_url="http://x/v1", model="m")
+    b._resolved_model = "m"
+    custom_max = config.MAX_PIXELS * 2
+    b.ocr_image(img, InferenceParams(max_pixels=custom_max))
+    w, h = _decoded_size(captured["url"])
+    assert w * h <= custom_max
 
 
 def test_ollama_sends_think_false(monkeypatch, tmp_path):
@@ -265,7 +384,7 @@ def test_500_then_200_retries_once(monkeypatch, tmp_path):
     )
     seen = _mock_post(monkeypatch, lambda r: next(replies))
     out = _backend().ocr_image(_page(tmp_path), InferenceParams())
-    assert out == "ok"
+    assert out.text == "ok"
     assert len(seen) == 2
     assert seen[0].content == seen[1].content  # same request, same model
 

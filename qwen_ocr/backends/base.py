@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 import httpx
@@ -42,6 +43,51 @@ _KV_RE = re.compile(
     r"[\"']?\s*[=:]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"',&;}]+)"
 )
 REDACTED = "***"
+
+# finish_reason / done_reason values that mean the model hit an output limit.
+# Truncated OCR is treated as a per-page FAILURE (never silent partial text).
+TRUNCATION_REASONS = frozenset({"length", "max_tokens"})
+
+
+@dataclass(frozen=True)
+class ImageSendMetrics:
+    """Original vs resized dimensions for one page image."""
+
+    original_width: int
+    original_height: int
+    sent_width: int
+    sent_height: int
+    min_pixels: int
+    max_pixels: int
+
+    @property
+    def original_megapixels(self) -> float:
+        return self.original_width * self.original_height / 1e6
+
+    @property
+    def sent_megapixels(self) -> float:
+        return self.sent_width * self.sent_height / 1e6
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class OcrImageResult:
+    """One page OCR call: raw assistant text plus provenance for sidecars."""
+
+    text: str
+    finish_reason: str | None
+    usage: TokenUsage
+    image: ImageSendMetrics
+    model: str
+
+    @property
+    def truncated(self) -> bool:
+        return (self.finish_reason or "") in TRUNCATION_REASONS
 
 
 def redact_credentials(text: str, secrets: tuple[str, ...] = ()) -> str:
@@ -103,26 +149,25 @@ class Backend(abc.ABC):
             return {}
         return {"chat_template_kwargs": {"enable_thinking": False}}
 
-    def ocr_image(self, image_path: Path, params: InferenceParams) -> str:
+    def ocr_image(self, image_path: Path, params: InferenceParams) -> OcrImageResult:
         """OCR a single page image to Markdown via OpenAI-compatible chat."""
         base_url, api_key, model = self._endpoint()
-        data_url = _encode_image(image_path, params.min_pixels, params.max_pixels)
+        data_url, image_metrics = _encode_image(image_path, params.min_pixels, params.max_pixels)
 
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
+        text_part = {"type": "text", "text": params.prompt}
+        image_part = {"type": "image_url", "image_url": {"url": data_url}}
+        if params.message_order == "image-first":
+            content = [image_part, text_part]
+        else:
+            content = [text_part, image_part]
+
         payload = {
             "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": params.prompt},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
+            "messages": [{"role": "user", "content": content}],
             "max_tokens": params.max_output_tokens,
             "temperature": params.temperature,
             # OpenAI ignores unknown keys; vLLM/Ollama/DashScope honour these.
@@ -149,7 +194,14 @@ class Backend(abc.ABC):
             **extra,
         )
         data = resp.json()
-        return _extract_text(data)
+        text, finish_reason = _extract_text_and_finish_reason(data)
+        return OcrImageResult(
+            text=text,
+            finish_reason=finish_reason,
+            usage=_extract_usage(data),
+            image=image_metrics,
+            model=model,
+        )
 
 
 def _post_with_5xx_retry(
@@ -190,7 +242,7 @@ def _post_with_5xx_retry(
     return resp
 
 
-def _encode_image(image_path: Path, min_pixels: int, max_pixels: int) -> str:
+def _encode_image(image_path: Path, min_pixels: int, max_pixels: int) -> tuple[str, ImageSendMetrics]:
     """Base64 data URL, resized to the patch-aligned pixel budget (issue #5).
 
     The resolution the model actually sees is decided here, not by the server's
@@ -221,15 +273,57 @@ def _encode_image(image_path: Path, min_pixels: int, max_pixels: int) -> str:
             min_pixels / 1e6,
             max_pixels / 1e6,
         )
+        metrics = ImageSendMetrics(
+            original_width=w,
+            original_height=h,
+            sent_width=target[0],
+            sent_height=target[1],
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
         buf = BytesIO()
         img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+    return f"data:image/png;base64,{b64}", metrics
+
+
+def _extract_finish_reason(data: dict[str, Any]) -> str | None:
+    """OpenAI ``choices[0].finish_reason`` or Ollama native ``done_reason``."""
+    try:
+        choice = data["choices"][0]
+        reason = choice.get("finish_reason")
+        if reason is not None:
+            return str(reason)
+    except (KeyError, IndexError, TypeError):
+        pass
+    done = data.get("done_reason")
+    return str(done) if done is not None else None
+
+
+def _extract_usage(data: dict[str, Any]) -> TokenUsage:
+    usage = data.get("usage") or {}
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if prompt is None and completion is None:
+        prompt = data.get("prompt_eval_count")
+        completion = data.get("eval_count")
+    return TokenUsage(
+        prompt_tokens=int(prompt) if prompt is not None else None,
+        completion_tokens=int(completion) if completion is not None else None,
+    )
+
+
+def _extract_text_and_finish_reason(data: dict[str, Any]) -> tuple[str, str | None]:
+    """Pull assistant text and finish/done reason from an OpenAI-compatible response."""
+    try:
+        message = data["choices"][0]["message"]
+        text = (message.get("content") or "").strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"unexpected OCR response shape: {data!r}") from exc
+    return text, _extract_finish_reason(data)
 
 
 def _extract_text(data: dict) -> str:
-    """Pull assistant text from an OpenAI-compatible response."""
-    try:
-        return (data["choices"][0]["message"]["content"] or "").strip()
-    except (KeyError, IndexError, TypeError) as exc:  # malformed/empty response
-        raise ValueError(f"unexpected OCR response shape: {data!r}") from exc
+    """Pull assistant text only (tests / legacy callers)."""
+    text, _ = _extract_text_and_finish_reason(data)
+    return text
