@@ -16,6 +16,7 @@ from qwen_ocr.backends.base import (
     _extract_finish_reason,
     _extract_text,
     _extract_text_and_finish_reason,
+    _extract_usage,
 )
 from qwen_ocr.backends.ollama import OllamaBackend
 from qwen_ocr.backends.vllm import VLLMBackend
@@ -164,8 +165,6 @@ def test_extract_finish_reason_ollama_done_reason():
 
 def test_extract_usage_openai_and_ollama():
     oai = {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "choices": [{}]}
-    from qwen_ocr.backends.base import _extract_usage
-
     u = _extract_usage(oai)
     assert u.prompt_tokens == 100 and u.completion_tokens == 50
     ollama = {"prompt_eval_count": 80, "eval_count": 40, "choices": [{}]}
@@ -185,9 +184,9 @@ def test_encode_image_sent_size_grows_with_max_pixels(tmp_path):
     high_ceiling = config.MAX_PIXELS * 4
     high_url, high_m = _encode_image(img, config.MIN_PIXELS, high_ceiling)
     assert low_m.sent_megapixels < high_m.sent_megapixels
-    assert _decoded_size(high_url)[0] * _decoded_size(high_url)[1] > _decoded_size(low_url)[
-        0
-    ] * _decoded_size(low_url)[1]
+    low_area = _decoded_size(low_url)[0] * _decoded_size(low_url)[1]
+    high_area = _decoded_size(high_url)[0] * _decoded_size(high_url)[1]
+    assert high_area > low_area
 
 
 def test_ocr_image_posts_and_parses(monkeypatch, tmp_path):

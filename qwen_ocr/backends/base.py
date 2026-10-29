@@ -242,7 +242,9 @@ def _post_with_5xx_retry(
     return resp
 
 
-def _encode_image(image_path: Path, min_pixels: int, max_pixels: int) -> tuple[str, ImageSendMetrics]:
+def _encode_image(
+    image_path: Path, min_pixels: int, max_pixels: int
+) -> tuple[str, ImageSendMetrics]:
     """Base64 data URL, resized to the patch-aligned pixel budget (issue #5).
 
     The resolution the model actually sees is decided here, not by the server's
